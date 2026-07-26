@@ -758,6 +758,53 @@ class TestThreadEngagement:
         assert adapter._ts_key("T1", "8000.0") in adapter._bot_message_ts
 
     @pytest.mark.asyncio
+    async def test_proactive_send_scopes_ts_to_primary_workspace(self):
+        """A proactive send with no metadata and an unmapped channel (e.g. a
+        cron notification right after boot, when the in-memory _channel_team
+        cache is empty) must scope the tracked ts to the primary connection's
+        workspace — matching _get_client's primary-client fallback — instead
+        of storing a bare key the team-scoped inbound check would miss."""
+        adapter = _make_adapter()
+        adapter._connections[0].team_id = "T1"
+        adapter._channel_team = {}  # fresh boot: channel→team cache empty
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "7000.5"}
+        )
+
+        await adapter.send(chat_id="C_NEW", content="cron notification")
+
+        assert adapter._ts_key("T1", "7000.5") in adapter._bot_message_ts
+        assert "7000.5" not in adapter._bot_message_ts
+
+    @pytest.mark.asyncio
+    async def test_bare_stored_ts_matched_by_scoped_check(self):
+        """A ts stored bare (residual add path where no workspace resolved)
+        must still be matched by the inbound membership check even when the
+        event carries a team_id — the check falls back to the bare key."""
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+        adapter._bot_message_ts.add("5000.0")  # bare: stored with no team
+
+        event = {
+            "text": "follow-up without mention",
+            "user": "U_USER",
+            "channel": "C1",
+            "ts": "5000.1",
+            "thread_ts": "5000.0",
+            "channel_type": "channel",
+            "team": "T1",
+        }
+        with patch.object(
+            adapter, "_has_active_session_for_thread", return_value=False
+        ), patch.object(
+            adapter, "_fetch_thread_context", new_callable=AsyncMock, return_value=""
+        ):
+            await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_bot_message_ts_cap(self):
         """Verify memory is bounded when many messages are sent."""
         adapter = _make_adapter()

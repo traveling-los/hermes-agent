@@ -1552,6 +1552,26 @@ class SlackAdapter(BasePlatformAdapter):
         """
         return f"{team_id}:{ts}" if team_id else ts
 
+    def _send_team_id(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Resolve the workspace an outbound message is actually posted to.
+
+        Mirrors ``_get_client()``'s routing: explicit metadata team first,
+        then the channel→team cache, and finally the primary connection —
+        because when neither resolves, ``_get_client()`` falls back to the
+        primary workspace's client, so that workspace's team_id is the
+        correct scope for ts tracking. Without the final fallback, proactive
+        sends right after boot (empty in-memory ``_channel_team``, no
+        metadata — e.g. cron notifications) would store bare ts keys that
+        the team-scoped inbound checks could never match.
+        """
+        return (
+            self._metadata_team_id(metadata)
+            or self._channel_team.get(chat_id, "")
+            or (self._connections[0].team_id if self._connections else "")
+        )
+
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
         if team_id and team_id in self._team_clients:
@@ -1632,9 +1652,7 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
-                sent_team_id = self._metadata_team_id(metadata) or self._channel_team.get(
-                    chat_id, ""
-                )
+                sent_team_id = self._send_team_id(chat_id, metadata)
                 self._bot_message_ts.add(self._ts_key(sent_team_id, sent_ts))
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
@@ -2139,7 +2157,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Treat successful file uploads as bot participation in a thread."""
         if not thread_ts:
             return
-        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id, "")
+        team_id = self._send_team_id(chat_id, metadata)
         self._bot_message_ts.add(self._ts_key(team_id, thread_ts))
         if len(self._bot_message_ts) > self._BOT_TS_MAX:
             excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
@@ -3540,13 +3558,16 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
-                reply_to_bot_thread = is_thread_reply and self._ts_key(
-                    team_id, event_thread_ts
-                ) in self._bot_message_ts
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and self._ts_key(team_id, event_thread_ts)
-                    in self._mentioned_threads
+                # Membership checks try the team-scoped key first, then fall
+                # back to the bare ts — defensive cover for any residual add
+                # path where no workspace could be resolved (stored bare).
+                reply_to_bot_thread = is_thread_reply and (
+                    self._ts_key(team_id, event_thread_ts) in self._bot_message_ts
+                    or event_thread_ts in self._bot_message_ts
+                )
+                in_mentioned_thread = event_thread_ts is not None and (
+                    self._ts_key(team_id, event_thread_ts) in self._mentioned_threads
+                    or event_thread_ts in self._mentioned_threads
                 )
                 has_session = is_thread_reply and self._has_active_session_for_thread(
                     channel_id=channel_id,
