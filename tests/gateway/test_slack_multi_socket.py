@@ -185,6 +185,16 @@ def test_connect_config_error_more_app_tokens():
             p.stop()
 
 
+def test_ts_keys_scoped_by_team():
+    ad = _make_adapter("xoxb-a")
+    assert ad._ts_key("T1", "123.45") == "T1:123.45"
+    assert ad._ts_key("", "123.45") == "123.45"
+    # Same ts in two workspaces must not collide in the bot-message set.
+    ad._bot_message_ts.add(ad._ts_key("T1", "111.0"))
+    assert ad._ts_key("T2", "111.0") not in ad._bot_message_ts
+    assert ad._ts_key("T1", "111.0") in ad._bot_message_ts
+
+
 def test_connect_watchdog_failure_after_running_tears_down_and_releases_locks():
     """A failure after ``_running`` flips True (e.g. watchdog start) must not
     leave live sockets behind a False connect(): ``_running`` resets, every

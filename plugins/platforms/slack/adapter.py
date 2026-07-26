@@ -1539,6 +1539,19 @@ class SlackAdapter(BasePlatformAdapter):
             or ""
         )
 
+    def _ts_key(self, team_id: str, ts: str) -> str:
+        """Namespace a Slack ``ts`` by workspace for cross-team-safe caching.
+
+        Slack ``ts`` values are unique only within a workspace — with more
+        than one workspace connected via Socket Mode, the dedup cache and
+        bot-message/thread tracking sets must not treat the same ``ts`` from
+        two different teams as the same message/thread. Falls back to the
+        bare ``ts`` when ``team_id`` is falsy so metadata-less paths (e.g.
+        existing single-workspace tests/fakes with no team_id) degrade to
+        today's behavior instead of silently missing cache hits.
+        """
+        return f"{team_id}:{ts}" if team_id else ts
+
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
         if team_id and team_id in self._team_clients:
@@ -1619,10 +1632,13 @@ class SlackAdapter(BasePlatformAdapter):
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
             if sent_ts:
-                self._bot_message_ts.add(sent_ts)
+                sent_team_id = self._metadata_team_id(metadata) or self._channel_team.get(
+                    chat_id, ""
+                )
+                self._bot_message_ts.add(self._ts_key(sent_team_id, sent_ts))
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
-                    self._bot_message_ts.add(thread_ts)
+                    self._bot_message_ts.add(self._ts_key(sent_team_id, thread_ts))
                 if len(self._bot_message_ts) > self._BOT_TS_MAX:
                     excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
                     for old_ts in list(self._bot_message_ts)[:excess]:
@@ -1972,7 +1988,7 @@ class SlackAdapter(BasePlatformAdapter):
                     initial_comment=caption or "",
                     thread_ts=thread_ts,
                 )
-                self._record_uploaded_file_thread(chat_id, thread_ts)
+                self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 return SendResult(success=True, raw_response=result)
             except Exception as exc:
                 last_exc = exc
@@ -2100,7 +2116,7 @@ class SlackAdapter(BasePlatformAdapter):
                     initial_comment=initial_comment,
                     thread_ts=thread_ts,
                 )
-                self._record_uploaded_file_thread(chat_id, thread_ts)
+                self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 _ = result
             except Exception as e:
                 logger.warning(
@@ -2115,12 +2131,16 @@ class SlackAdapter(BasePlatformAdapter):
                 )
 
     def _record_uploaded_file_thread(
-        self, chat_id: str, thread_ts: Optional[str]
+        self,
+        chat_id: str,
+        thread_ts: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Treat successful file uploads as bot participation in a thread."""
         if not thread_ts:
             return
-        self._bot_message_ts.add(thread_ts)
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id, "")
+        self._bot_message_ts.add(self._ts_key(team_id, thread_ts))
         if len(self._bot_message_ts) > self._BOT_TS_MAX:
             excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
             for old_ts in list(self._bot_message_ts)[:excess]:
@@ -2527,7 +2547,7 @@ class SlackAdapter(BasePlatformAdapter):
                 initial_comment=caption or "",
                 thread_ts=thread_ts,
             )
-            self._record_uploaded_file_thread(chat_id, thread_ts)
+            self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
 
             return SendResult(success=True, raw_response=result)
 
@@ -2605,7 +2625,7 @@ class SlackAdapter(BasePlatformAdapter):
                         initial_comment=caption or "",
                         thread_ts=thread_ts,
                     )
-                    self._record_uploaded_file_thread(chat_id, thread_ts)
+                    self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                     return SendResult(success=True, raw_response=result)
                 except Exception as exc:
                     last_exc = exc
@@ -2667,7 +2687,7 @@ class SlackAdapter(BasePlatformAdapter):
                         initial_comment=caption or "",
                         thread_ts=thread_ts,
                     )
-                    self._record_uploaded_file_thread(chat_id, thread_ts)
+                    self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                     return SendResult(success=True, raw_response=result)
                 except Exception as exc:
                     last_exc = exc
@@ -3231,7 +3251,7 @@ class SlackAdapter(BasePlatformAdapter):
         # If it does, _handle_slack_message records the same share ts and this
         # fallback skips instead of duplicating the user turn.
         await asyncio.sleep(0.75)
-        if ts and self._dedup.is_duplicate(ts):
+        if ts and self._dedup.is_duplicate(self._ts_key(team_id, ts)):
             return
 
         fallback_event = {
@@ -3253,9 +3273,15 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
+        # Derive the workspace once, up front, so every cache lookup below
+        # (dedup, bot-message/thread tracking) is scoped consistently. This
+        # may be refined below once assistant-thread metadata is available
+        # (some assistant lifecycle events omit team_id on the event/body).
+        outer_team_id = self._event_team_id(event, payload)
+
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
-        if event_ts and self._dedup.is_duplicate(event_ts):
+        if event_ts and self._dedup.is_duplicate(self._ts_key(outer_team_id, event_ts)):
             return
 
         # Bot message filtering (SLACK_ALLOW_BOTS / config allow_bots):
@@ -3403,7 +3429,6 @@ class SlackAdapter(BasePlatformAdapter):
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
-        outer_team_id = self._event_team_id(event, payload)
         assistant_meta = self._lookup_assistant_thread_metadata(
             event,
             channel_id=channel_id,
@@ -3515,12 +3540,13 @@ class SlackAdapter(BasePlatformAdapter):
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
+                reply_to_bot_thread = is_thread_reply and self._ts_key(
+                    team_id, event_thread_ts
+                ) in self._bot_message_ts
                 in_mentioned_thread = (
                     event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
+                    and self._ts_key(team_id, event_thread_ts)
+                    in self._mentioned_threads
                 )
                 has_session = is_thread_reply and self._has_active_session_for_thread(
                     channel_id=channel_id,
@@ -3543,7 +3569,7 @@ class SlackAdapter(BasePlatformAdapter):
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
             if event_thread_ts and not self._slack_strict_mention():
-                self._mentioned_threads.add(event_thread_ts)
+                self._mentioned_threads.add(self._ts_key(team_id, event_thread_ts))
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[
                         : self._MENTIONED_THREADS_MAX // 2

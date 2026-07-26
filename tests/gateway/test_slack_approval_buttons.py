@@ -751,9 +751,11 @@ class TestThreadEngagement:
 
         await adapter.send(chat_id="C1", content="Hello!", metadata={"thread_id": "8000.0"})
 
-        assert "9000.1" in adapter._bot_message_ts
+        # Channel C1 resolves to workspace T1 via _channel_team, so tracked
+        # ts values are scoped by workspace (see _ts_key).
+        assert adapter._ts_key("T1", "9000.1") in adapter._bot_message_ts
         # Thread root should also be tracked
-        assert "8000.0" in adapter._bot_message_ts
+        assert adapter._ts_key("T1", "8000.0") in adapter._bot_message_ts
 
     @pytest.mark.asyncio
     async def test_bot_message_ts_cap(self):
