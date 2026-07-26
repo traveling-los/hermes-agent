@@ -308,6 +308,32 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+def parse_socket_pairs(
+    raw_bot_tokens: str, raw_app_tokens: str
+) -> Optional[List[Tuple[str, str]]]:
+    """Pair comma-separated bot tokens with app tokens, one pair per socket.
+
+    Socket count = number of app tokens; ``app_tokens[i]`` pairs with
+    ``bot_tokens[i]``. Bot tokens beyond the app-token count are legal
+    (outbound-only workspaces, the pre-existing multi-token behavior).
+    More app tokens than bot tokens is a config error → ``None``.
+    """
+    bot_tokens = [t.strip() for t in (raw_bot_tokens or "").split(",") if t.strip()]
+    app_tokens = [t.strip() for t in (raw_app_tokens or "").split(",") if t.strip()]
+    if not bot_tokens or not app_tokens:
+        return None
+    if len(app_tokens) > len(bot_tokens):
+        logger.error(
+            "[Slack] %d SLACK_APP_TOKEN entries but only %d SLACK_BOT_TOKEN "
+            "entries — each Socket Mode app token needs its own bot token "
+            "(paired by position).",
+            len(app_tokens),
+            len(bot_tokens),
+        )
+        return None
+    return list(zip(bot_tokens[: len(app_tokens)], app_tokens))
+
+
 # Map Slack audio mimetypes to the file extension that matches the actual
 # container bytes.  Critically, Slack's in-app "record a clip" voice messages
 # arrive as MP4/AAC containers (``audio/mp4``, filename ``audio_message*.mp4``),
