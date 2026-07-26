@@ -1416,15 +1416,36 @@ class SlackAdapter(BasePlatformAdapter):
                 # acquired lock since ``_running`` is still False.
                 return False
 
-            self._running = True
-            self._ensure_socket_watchdog()
+            # Bring up ``_running`` + watchdog atomically. If anything here
+            # raises after ``_running`` flips to True, we must reset it,
+            # stop every handler the pairs loop started, and re-raise —
+            # otherwise the outer except would report failure while sockets
+            # are actually live, and the ``finally`` block (gated on
+            # ``_running`` being False) would skip lock release. Mirrors the
+            # pre-multi-socket safety net around the same sequence.
+            try:
+                self._running = True
+                self._ensure_socket_watchdog()
 
-            logger.info(
-                "[Slack] Socket Mode connected (%d workspace(s), %d total "
-                "token(s))",
-                len(self._connections),
-                len(self._team_clients),
-            )
+                logger.info(
+                    "[Slack] Socket Mode connected (%d workspace(s), %d total "
+                    "token(s))",
+                    len(self._connections),
+                    len(self._team_clients),
+                )
+            except Exception:
+                self._running = False
+                for _started_conn in self._connections:
+                    try:
+                        await self._stop_socket_mode_handler(_started_conn)
+                    except Exception:  # pragma: no cover - defensive logging
+                        logger.debug(
+                            "[Slack] Cleanup after failed start raised",
+                            exc_info=True,
+                        )
+                self._connections = []
+                raise
+
             return True
 
         except Exception as e:  # pragma: no cover - defensive logging

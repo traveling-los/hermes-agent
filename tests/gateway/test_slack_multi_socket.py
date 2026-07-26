@@ -183,3 +183,38 @@ def test_connect_config_error_more_app_tokens():
     finally:
         for p in patches:
             p.stop()
+
+
+def test_connect_watchdog_failure_after_running_tears_down_and_releases_locks():
+    """A failure after ``_running`` flips True (e.g. watchdog start) must not
+    leave live sockets behind a False connect(): ``_running`` resets, every
+    started handler is stopped, connections are cleared, and the ``finally``
+    block releases the acquired app-token locks."""
+    auth = {
+        "xoxb-a": {"team_id": "T1", "user_id": "U1", "user": "mia", "team": "careflow"},
+    }
+    ad = _make_adapter("xoxb-a")
+    patches = _patched_env("xapp-1", auth)
+    # Use the real base-class lock helpers so lock release is observable,
+    # patching the gateway.status primitives they delegate to instead.
+    patches[5] = patch("gateway.status.acquire_scoped_lock", return_value=(True, None))
+    patches[6] = patch("gateway.status.release_scoped_lock")
+    watchdog_boom = patch.object(
+        SlackAdapter,
+        "_ensure_socket_watchdog",
+        side_effect=RuntimeError("watchdog boom"),
+    )
+    started = [p.start() for p in patches]
+    mock_release = started[6]
+    watchdog_boom.start()
+    try:
+        ok = _run(ad.connect())
+        assert ok is False
+        assert ad._running is False
+        assert ad._connections == []  # started handler stopped and cleared
+        assert ad._socket_lock_identities == []  # lock bookkeeping cleared
+        mock_release.assert_called_once_with("slack-app-token", "xapp-1")
+    finally:
+        watchdog_boom.stop()
+        for p in patches:
+            p.stop()
