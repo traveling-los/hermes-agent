@@ -538,6 +538,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._proxy_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_watchdog_interval_s = 15.0
+        # Scoped-lock identities (app tokens) acquired for the currently-open
+        # sockets, one per ``_WorkspaceConnection``. All-or-nothing per
+        # ``connect()`` call; released together via
+        # ``_release_all_socket_locks``.
+        self._socket_lock_identities: List[str] = []
 
     @property
     def _app(self):
@@ -1188,6 +1193,21 @@ class SlackAdapter(BasePlatformAdapter):
                 len(_plugin_handlers),
             )
 
+    def _release_all_socket_locks(self) -> None:
+        """Release every scoped lock acquired for the current sockets.
+
+        Each open ``_WorkspaceConnection`` holds its own ``slack-app-token``
+        scoped lock (keyed by that workspace's app token). Replaces
+        ``_release_platform_lock()`` for this adapter, which only tracks a
+        single identity and would leak every lock beyond the last one
+        acquired in a multi-socket ``connect()``.
+        """
+        from gateway.status import release_scoped_lock
+
+        for identity in self._socket_lock_identities:
+            release_scoped_lock("slack-app-token", identity)
+        self._socket_lock_identities = []
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
         if not SLACK_AVAILABLE:
@@ -1204,6 +1224,10 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         if not app_token:
             logger.error("[Slack] SLACK_APP_TOKEN not set")
+            return False
+
+        pairs = parse_socket_pairs(raw_token, app_token)
+        if pairs is None:
             return False
 
         proxy_url = _resolve_slack_proxy_url()
@@ -1240,10 +1264,21 @@ class SlackAdapter(BasePlatformAdapter):
 
         lock_acquired = False
         try:
-            if not self._acquire_platform_lock(
-                "slack-app-token", app_token, "Slack app token"
-            ):
-                return False
+            # Per-app-token scoped locks: ALL must be acquired or we abort (a
+            # lock conflict means another process already owns that socket —
+            # split-brain risk if we proceeded with only some of them).
+            acquired: List[str] = []
+            for _bot, _apptok in pairs:
+                if not self._acquire_platform_lock(
+                    "slack-app-token", _apptok, "Slack app token"
+                ):
+                    from gateway.status import release_scoped_lock
+
+                    for ident in acquired:
+                        release_scoped_lock("slack-app-token", ident)
+                    return False
+                acquired.append(_apptok)
+            self._socket_lock_identities = acquired
             lock_acquired = True
             self._running = False
 
@@ -1285,17 +1320,16 @@ class SlackAdapter(BasePlatformAdapter):
             self._team_clients = {}
             self._team_bot_user_ids = {}
 
-            # First token is the primary — used for AsyncApp / Socket Mode.
-            # Single connection today (Task 2); Task 3 builds one
-            # ``_WorkspaceConnection`` per parsed socket pair.
-            primary_token = bot_tokens[0]
-            conn = _WorkspaceConnection(bot_token=primary_token, app_token=app_token)
-            conn.app = AsyncApp(token=primary_token)
-            _apply_slack_proxy(conn.app.client, proxy_url)
-            self._connections.append(conn)
-
-            # Register each bot token and map team_id → client
+            # Bot tokens that already have a Socket Mode connection via
+            # ``pairs`` do their auth in the loop below (not here) — this
+            # loop only covers OUTBOUND-only tokens: env bot tokens beyond
+            # the paired app tokens, and tokens loaded from
+            # ``slack_tokens.json``. Kept literally the same auth/bookkeeping
+            # as before Task 3, just skipping socket-paired tokens.
+            socket_bot_tokens = {bt for bt, _ in pairs}
             for token in bot_tokens:
+                if token in socket_bot_tokens:
+                    continue
                 client = AsyncWebClient(token=token)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
@@ -1314,7 +1348,8 @@ class SlackAdapter(BasePlatformAdapter):
                     self._bot_user_id = bot_user_id
 
                 logger.info(
-                    "[Slack] Authenticated as @%s in workspace %s (team: %s)",
+                    "[Slack] Authenticated as @%s in workspace %s (team: %s) "
+                    "[outbound-only]",
                     bot_name,
                     team_name,
                     team_id,
@@ -1324,29 +1359,70 @@ class SlackAdapter(BasePlatformAdapter):
                 self._warn_if_not_bot_token(auth_response, team_name)
                 self._warn_if_inchannel_without_flat_reply(team_name)
 
-            self._register_listeners(conn.app)
-
-            # Bring up the handler and watchdog atomically. ``_running`` only
-            # flips to True after the handler is alive so the watchdog loop
-            # observes the live task immediately; on any failure here we tear
-            # down whatever we managed to start, leave ``_running=False``, and
-            # let the ``finally`` block release the platform lock cleanly.
-            try:
-                self._start_socket_mode_handler(conn)
-                self._running = True
-                self._ensure_socket_watchdog()
-            except Exception:
-                self._running = False
+            # One ``_WorkspaceConnection`` (with its own Socket Mode handler)
+            # per parsed (bot, app) token pair. A single workspace's auth or
+            # handler-start failure logs and is skipped — partial degradation
+            # — rather than aborting every other workspace's socket.
+            for bt, apptok in pairs:
+                conn = _WorkspaceConnection(bot_token=bt, app_token=apptok)
                 try:
-                    await self._stop_socket_mode_handler(conn)
-                except Exception:  # pragma: no cover - defensive logging
-                    logger.debug(
-                        "[Slack] Cleanup after failed start raised", exc_info=True
+                    client = AsyncWebClient(token=bt)
+                    _apply_slack_proxy(client, proxy_url)
+                    auth_response = await client.auth_test()
+                    conn.team_id = auth_response.get("team_id", "")
+                    conn.team_name = auth_response.get("team", "unknown")
+                    bot_user_id = auth_response.get("user_id", "")
+                    bot_name = auth_response.get("user", "unknown")
+
+                    self._team_clients[conn.team_id] = client
+                    self._team_bot_user_ids[conn.team_id] = bot_user_id
+                    if self._bot_user_id is None:
+                        self._bot_user_id = bot_user_id
+
+                    logger.info(
+                        "[Slack] Authenticated as @%s in workspace %s (team: %s)",
+                        bot_name,
+                        conn.team_name,
+                        conn.team_id,
                     )
-                raise
+
+                    self._warn_if_missing_group_dm_scopes(
+                        auth_response, conn.team_name
+                    )
+                    self._warn_if_not_bot_token(auth_response, conn.team_name)
+                    self._warn_if_inchannel_without_flat_reply(conn.team_name)
+
+                    conn.app = AsyncApp(token=bt)
+                    _apply_slack_proxy(conn.app.client, proxy_url)
+                    self._register_listeners(conn.app)
+                    self._start_socket_mode_handler(conn)
+                    self._connections.append(conn)
+                    logger.info(
+                        "[Slack] Socket Mode workspace up: %s (team %s)",
+                        conn.team_name,
+                        conn.team_id,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "[Slack] Workspace socket failed (app token %s...): "
+                        "%s — continuing without it",
+                        apptok[:14],
+                        e,
+                        exc_info=True,
+                    )
+
+            if not self._connections:
+                # Nothing came up — real failure. ``finally`` releases every
+                # acquired lock since ``_running`` is still False.
+                return False
+
+            self._running = True
+            self._ensure_socket_watchdog()
 
             logger.info(
-                "[Slack] Socket Mode connected (%d workspace(s))",
+                "[Slack] Socket Mode connected (%d workspace(s), %d total "
+                "token(s))",
+                len(self._connections),
                 len(self._team_clients),
             )
             return True
@@ -1356,7 +1432,7 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         finally:
             if lock_acquired and not self._running:
-                self._release_platform_lock()
+                self._release_all_socket_locks()
 
     async def create_handoff_thread(
         self,
@@ -1426,7 +1502,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._connections = []
         self._proxy_url = None
 
-        self._release_platform_lock()
+        self._release_all_socket_locks()
 
         logger.info("[Slack] Disconnected")
 

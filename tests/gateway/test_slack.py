@@ -310,7 +310,11 @@ class TestSlackConnectCleanup:
 
         assert result is False
         mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
-        assert adapter._platform_lock_identity is None
+        # Multi-socket connect() tracks acquired locks in
+        # ``_socket_lock_identities`` (released via
+        # ``_release_all_socket_locks``) rather than the single-identity
+        # ``_platform_lock_identity`` the base-class helper uses.
+        assert adapter._socket_lock_identities == []
 
     @pytest.mark.asyncio
     async def test_reconnect_closes_previous_handler_to_prevent_zombie_socket(self):
