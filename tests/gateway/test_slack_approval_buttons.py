@@ -42,7 +42,7 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection
 from gateway.config import PlatformConfig, Platform
 
 
@@ -50,7 +50,11 @@ def _make_adapter():
     """Create a SlackAdapter instance with mocked internals."""
     config = PlatformConfig(enabled=True, token="xoxb-test-token")
     adapter = SlackAdapter(config)
-    adapter._app = MagicMock()
+    adapter._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-test-token", app_token="xapp-test", app=MagicMock()
+        )
+    ]
     adapter._bot_user_id = "U_BOT"
     adapter._team_clients = {"T1": AsyncMock()}
     adapter._team_bot_user_ids = {"T1": "U_BOT"}
@@ -158,7 +162,7 @@ class TestSlackExecApproval:
     @pytest.mark.asyncio
     async def test_not_connected(self):
         adapter = _make_adapter()
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_exec_approval(
             chat_id="C1", command="ls", session_key="s"
         )

@@ -69,7 +69,28 @@ import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
+
+
+def _install_mock_app(adapter, app=None, **conn_kwargs):
+    """Test helper: give ``adapter`` a single mocked workspace connection.
+
+    Mirrors what ``connect()`` would populate, so tests that used to poke
+    the old singleton ``adapter._app = MagicMock()`` can instead go through
+    ``adapter._connections[0]`` (see Task 2's ``_WorkspaceConnection``
+    refactor — ``_app`` is now a read-only property over ``_connections``).
+    """
+    if app is None:
+        app = MagicMock()
+        app.client = AsyncMock()
+    conn_kwargs.setdefault("bot_token", "xoxb-fake-token")
+    conn_kwargs.setdefault("app_token", "xapp-fake")
+    conn = _WorkspaceConnection(app=app, **conn_kwargs)
+    adapter._connections = [conn]
+    return conn
 
 
 async def _pending_for_fake_task():
@@ -107,8 +128,7 @@ def adapter():
     config = PlatformConfig(enabled=True, token="xoxb-fake-token")
     a = SlackAdapter(config)
     # Mock the Slack app client
-    a._app = MagicMock()
-    a._app.client = AsyncMock()
+    _install_mock_app(a)
     a._bot_user_id = "U_BOT"
     a._running = True
     # Capture events instead of processing them
@@ -307,7 +327,7 @@ class TestSlackConnectCleanup:
         # Simulate state left over from a prior connect() call.
         first_handler = AsyncMock()
         first_handler.close_async = AsyncMock()
-        adapter._handler = first_handler
+        _install_mock_app(adapter, handler=first_handler)
 
         mock_app = MagicMock()
 
@@ -353,7 +373,7 @@ class TestSlackConnectCleanup:
 
         assert result is True
         first_handler.close_async.assert_awaited_once_with()
-        assert adapter._handler is second_handler
+        assert adapter._connections[0].handler is second_handler
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +479,7 @@ class TestSlackSocketWatchdog:
                 assert len(instances) >= 2, "watchdog/done_callback did not reconnect"
                 assert instances[0].closed is True
                 assert instances[-1].start_calls == 1
-                assert adapter._handler is instances[-1]
+                assert adapter._connections[0].handler is instances[-1]
             finally:
                 await adapter.disconnect()
 
@@ -486,7 +506,7 @@ class TestSlackSocketWatchdog:
 
                 assert len(instances) >= 2, "watchdog did not heal dead transport"
                 assert instances[0].closed is True
-                assert adapter._handler is instances[-1]
+                assert adapter._connections[0].handler is instances[-1]
             finally:
                 await adapter.disconnect()
 
@@ -505,8 +525,7 @@ class TestSlackSocketWatchdog:
 
             await adapter.disconnect()
 
-            assert adapter._handler is None
-            assert adapter._socket_mode_task is None
+            assert adapter._connections == []
             assert adapter._socket_watchdog_task is None
             assert instances[0].closed is True
 
@@ -655,9 +674,10 @@ class TestSlackSocketWatchdog:
                 assert await adapter.connect() is True
                 baseline = len(instances)
 
+                conn = adapter._connections[0]
                 await asyncio.gather(
-                    adapter._restart_socket_mode("watchdog"),
-                    adapter._restart_socket_mode("done-callback"),
+                    adapter._restart_socket_mode(conn, "watchdog"),
+                    adapter._restart_socket_mode(conn, "done-callback"),
                 )
 
                 new_handlers = len(instances) - baseline
@@ -801,9 +821,12 @@ class TestSlackProxyBehavior:
             client.proxy == "http://proxy.example.com:3128"
             for client in created_clients
         )
-        assert adapter._handler is not None
-        assert adapter._handler.proxy == "http://proxy.example.com:3128"
-        assert adapter._handler.client.proxy == "http://proxy.example.com:3128"
+        assert adapter._connections[0].handler is not None
+        assert adapter._connections[0].handler.proxy == "http://proxy.example.com:3128"
+        assert (
+            adapter._connections[0].handler.client.proxy
+            == "http://proxy.example.com:3128"
+        )
         assert "hermes_feedback" in created_apps[0].registered_actions
 
     @pytest.mark.asyncio
@@ -889,9 +912,9 @@ class TestSlackProxyBehavior:
         assert result is True
         assert created_apps[0].client.proxy is None
         assert all(client.proxy is None for client in created_clients)
-        assert adapter._handler is not None
-        assert adapter._handler.proxy is None
-        assert adapter._handler.client.proxy is None
+        assert adapter._connections[0].handler is not None
+        assert adapter._connections[0].handler.proxy is None
+        assert adapter._connections[0].handler.client.proxy is None
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +992,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_send_document_not_connected(self, adapter):
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_document(
             chat_id="C123",
             file_path="/some/file.pdf",
@@ -1112,7 +1135,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_send_video_not_connected(self, adapter):
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_video(
             chat_id="C123",
             video_path="/some/video.mp4",
@@ -2822,7 +2845,7 @@ class TestEditMessageStreamingPipeline:
     @pytest.mark.asyncio
     async def test_edit_message_not_connected(self, adapter):
         """edit_message returns failure when adapter is not connected."""
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.edit_message("C123", "ts1", "**hello**")
         assert result.success is False
         assert "Not connected" in result.error
@@ -3056,8 +3079,7 @@ class TestThreadReplyHandling:
         """Create an adapter with a mock session store attached."""
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
@@ -3194,8 +3216,7 @@ class TestAssistantThreadLifecycle:
     def assistant_adapter(self, mock_session_store):
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
