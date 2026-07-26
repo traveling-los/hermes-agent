@@ -195,6 +195,175 @@ def test_ts_keys_scoped_by_team():
     assert ad._ts_key("T1", "111.0") in ad._bot_message_ts
 
 
+def test_connect_rollback_does_not_release_prior_session_locks():
+    """A reconnect (gateway restart / in-process reconnect) while a prior
+    session's sockets are still live must not release that prior session's
+    still-legitimate lock when a *later* pair in this attempt conflicts.
+
+    ``acquire_scoped_lock`` succeeds for same-pid re-acquisition, so the
+    first pair's app token (``xapp-1``, already held by ``_socket_lock_identities``
+    from the prior session) re-acquires cleanly here. The second pair's app
+    token (``xapp-2``) then fails as if held by another process. A naive
+    rollback that releases everything in ``acquired`` would delete the
+    still-running prior session's ``xapp-1`` lock, letting another gateway
+    grab it while this process keeps serving that workspace — the #18187
+    split-brain class (duplicate replies). The fix must skip releasing any
+    identity that was already held before this connect() attempt.
+    """
+    auth = {
+        "xoxb-a": {"team_id": "T1", "user_id": "U1", "user": "mia", "team": "careflow"},
+        "xoxb-b": {"team_id": "T2", "user_id": "U2", "user": "mia", "team": "iamia"},
+    }
+    ad = _make_adapter("xoxb-a,xoxb-b")
+    # Simulate a prior successful connect() whose sockets are still live.
+    ad._socket_lock_identities = ["xapp-1"]
+
+    patches = _patched_env("xapp-1,xapp-2", auth)
+
+    def _acquire_side_effect(scope, identity, metadata=None):
+        if identity == "xapp-2":
+            return (False, {"pid": 999})
+        return (True, None)  # xapp-1: same-pid re-acquisition succeeds
+
+    # Exercise the real base-class ``_acquire_platform_lock`` (unpatched) so
+    # the rollback logic under test actually runs; only fake the
+    # gateway.status primitives it delegates to.
+    patches[5] = patch(
+        "gateway.status.acquire_scoped_lock", side_effect=_acquire_side_effect
+    )
+    patches[6] = patch("gateway.status.release_scoped_lock")
+    started = [p.start() for p in patches]
+    mock_release = started[6]
+    try:
+        ok = _run(ad.connect())
+        assert ok is False
+        # xapp-1 was already held before this attempt — must never be released.
+        mock_release.assert_not_called()
+        # Failure path must leave prior-session bookkeeping intact.
+        assert ad._socket_lock_identities == ["xapp-1"]
+    finally:
+        for p in patches:
+            p.stop()
+
+
+# --- workspace identity in reconnect/watchdog logs -----------------------
+
+
+def test_conn_log_label_prefers_team_name_then_team_id_then_token():
+    conn = slack_adapter._WorkspaceConnection(
+        bot_token="xoxb-a", app_token="xapp-1234567890abcdef"
+    )
+    # neither team_name nor team_id set → short app-token prefix
+    assert slack_adapter._conn_log_label(conn) == "xapp-1234567890abcdef"[:14]
+    # team_name wins when present
+    conn.team_name = "careflow"
+    conn.team_id = "T1"
+    assert slack_adapter._conn_log_label(conn) == "careflow"
+    # falls back to team_id when team_name is empty
+    conn.team_name = ""
+    assert slack_adapter._conn_log_label(conn) == "T1"
+    # falls back to a short app-token prefix when neither is set
+    conn.team_id = ""
+    assert slack_adapter._conn_log_label(conn) == "xapp-1234567890abcdef"[:14]
+
+
+def test_restart_socket_mode_logs_workspace_identity(caplog):
+    ad = _make_adapter("xoxb-a")
+    ad._running = True
+    conn = slack_adapter._WorkspaceConnection(
+        bot_token="xoxb-a", app_token="xapp-1", team_name="careflow", team_id="T1"
+    )
+    conn.app = _FakeApp(token="xoxb-a")
+
+    with patch.object(slack_adapter, "AsyncSocketModeHandler", _FakeHandler):
+        with caplog.at_level("WARNING"):
+            _run(ad._restart_socket_mode(conn, "transport disconnected"))
+        try:
+            assert any(
+                "careflow" in r.getMessage() for r in caplog.records
+            ), [r.getMessage() for r in caplog.records]
+        finally:
+            _run(ad._stop_socket_mode_handler(conn))
+
+
+def test_restart_socket_mode_reconnect_failure_logs_workspace_identity(caplog):
+    ad = _make_adapter("xoxb-a")
+    ad._running = True
+    conn = slack_adapter._WorkspaceConnection(
+        bot_token="xoxb-a", app_token="xapp-1", team_name="iamia", team_id="T2"
+    )
+    conn.app = _FakeApp(token="xoxb-a")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("start failed")
+
+    with patch.object(ad, "_start_socket_mode_handler", side_effect=_boom):
+        with caplog.at_level("WARNING"):
+            _run(ad._restart_socket_mode(conn, "socket task stopped"))
+
+    assert any(
+        "iamia" in r.getMessage() and "reconnect failed" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_on_socket_mode_task_done_logs_workspace_identity_on_error(caplog):
+    ad = _make_adapter("xoxb-a")
+    ad._running = True
+    conn = slack_adapter._WorkspaceConnection(
+        bot_token="xoxb-a", app_token="xapp-1", team_name="iamia", team_id="T2"
+    )
+
+    async def _boom():
+        raise RuntimeError("socket boom")
+
+    async def _run_to_completion():
+        t = asyncio.ensure_future(_boom())
+        try:
+            await t
+        except RuntimeError:
+            pass
+        return t
+
+    task = _run(_run_to_completion())
+    conn.socket_task = task
+
+    with caplog.at_level("WARNING"):
+        ad._on_socket_mode_task_done(conn, task)
+
+    assert any(
+        "iamia" in r.getMessage() and "exited with error" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_on_socket_mode_task_done_logs_workspace_identity_on_unexpected_exit(caplog):
+    ad = _make_adapter("xoxb-a")
+    ad._running = True
+    conn = slack_adapter._WorkspaceConnection(
+        bot_token="xoxb-a", app_token="xapp-1", team_name="careflow", team_id="T1"
+    )
+
+    async def _noop():
+        return None
+
+    async def _run_to_completion():
+        t = asyncio.ensure_future(_noop())
+        await t
+        return t
+
+    task = _run(_run_to_completion())
+    conn.socket_task = task
+
+    with caplog.at_level("WARNING"):
+        ad._on_socket_mode_task_done(conn, task)
+
+    assert any(
+        "careflow" in r.getMessage() and "exited unexpectedly" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
 def test_connect_watchdog_failure_after_running_tears_down_and_releases_locks():
     """A failure after ``_running`` flips True (e.g. watchdog start) must not
     leave live sockets behind a False connect(): ``_running`` resets, every

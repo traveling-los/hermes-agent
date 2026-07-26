@@ -443,6 +443,23 @@ class _WorkspaceConnection:
     lock_identity: Optional[str] = None  # acquired scoped-lock identity
 
 
+def _conn_log_label(conn: "_WorkspaceConnection") -> str:
+    """Short workspace identity for log lines.
+
+    One Socket Mode watchdog serves every workspace's ``_WorkspaceConnection``,
+    so reconnect/failure logs must say *which* workspace was affected — a
+    bare "reconnecting" line is useless for attributing a workspace-specific
+    outage when several production workspaces share the same process. Prefers
+    ``team_name``/``team_id`` (populated after ``auth_test`` on connect); falls
+    back to a short app-token prefix before that point.
+    """
+    if conn.team_name:
+        return conn.team_name
+    if conn.team_id:
+        return conn.team_id
+    return (conn.app_token or "unknown")[:14]
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -625,14 +642,21 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not conn.app or not conn.app_token:
                 return
 
-            logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
+            logger.warning(
+                "[Slack] Socket Mode unhealthy (%s) for workspace %s; reconnecting",
+                reason,
+                _conn_log_label(conn),
+            )
             await self._stop_socket_mode_handler(conn)
 
             try:
                 self._start_socket_mode_handler(conn)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
-                    "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
+                    "[Slack] Socket Mode reconnect failed for workspace %s: %s",
+                    _conn_log_label(conn),
+                    exc,
+                    exc_info=True,
                 )
 
     async def _socket_watchdog_loop(self) -> None:
@@ -719,10 +743,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         if exc is not None:
             logger.warning(
-                "[Slack] Socket Mode task exited with error: %s", exc, exc_info=True
+                "[Slack] Socket Mode task exited with error for workspace %s: %s",
+                _conn_log_label(conn),
+                exc,
+                exc_info=True,
             )
         else:
-            logger.warning("[Slack] Socket Mode task exited unexpectedly")
+            logger.warning(
+                "[Slack] Socket Mode task exited unexpectedly for workspace %s",
+                _conn_log_label(conn),
+            )
 
         try:
             loop = asyncio.get_running_loop()
@@ -1267,6 +1297,22 @@ class SlackAdapter(BasePlatformAdapter):
             # Per-app-token scoped locks: ALL must be acquired or we abort (a
             # lock conflict means another process already owns that socket —
             # split-brain risk if we proceeded with only some of them).
+            #
+            # ``acquire_scoped_lock`` succeeds for same-pid re-acquisition, so
+            # when connect() runs again while sockets from a prior successful
+            # connect() are still live (gateway-restart / in-process-reconnect
+            # path), this loop re-acquires those already-held tokens without
+            # incident. Snapshot them BEFORE the loop so that if a LATER token
+            # in ``pairs`` then conflicts (held by another process), rollback
+            # releases only identities newly acquired by *this* attempt —
+            # never a lock the still-running prior session legitimately
+            # holds. Releasing a prior-session lock here would let another
+            # gateway acquire it while we keep serving that workspace, so
+            # both receive every event and double-reply (the #18187
+            # split-brain class). Note ``self._socket_lock_identities`` is
+            # only reassigned below on full success, so a rollback here
+            # leaves it exactly as it was for the prior session.
+            prior_identities = set(self._socket_lock_identities)
             acquired: List[str] = []
             for _bot, _apptok in pairs:
                 if not self._acquire_platform_lock(
@@ -1275,11 +1321,19 @@ class SlackAdapter(BasePlatformAdapter):
                     from gateway.status import release_scoped_lock
 
                     for ident in acquired:
-                        release_scoped_lock("slack-app-token", ident)
+                        if ident not in prior_identities:
+                            release_scoped_lock("slack-app-token", ident)
                     return False
                 acquired.append(_apptok)
             self._socket_lock_identities = acquired
             lock_acquired = True
+            # Multi-socket locks are tracked per-identity in
+            # ``_socket_lock_identities`` and released via
+            # ``_release_all_socket_locks()``; clear the base class's
+            # single-identity bookkeeping so a future base/gateway caller of
+            # ``_release_platform_lock()`` can't release one arbitrary token
+            # out of the several this adapter now holds.
+            self._platform_lock_identity = None
             self._running = False
 
             # Tear down any prior reconnect state before flipping ``_running``
