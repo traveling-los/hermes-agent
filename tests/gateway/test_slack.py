@@ -7966,19 +7966,29 @@ class TestDownloadTokenWorkspaceRouting:
         )
         assert token == "xoxb-team-two"
 
-    def test_unknown_team_falls_back_to_primary_token(self, adapter):
+    def test_unknown_team_falls_back_to_primary_client_token(self, adapter):
         adapter = self._adapter_with_teams(adapter)
+        adapter._app.client.token = "xoxb-primary-connection"
         token = adapter._resolve_download_token(
             "https://files.slack.com/files-pri/T0OTHER-F123/x.png", ""
         )
-        assert token == adapter.config.token
+        assert token == "xoxb-primary-connection"
+        # Must never fall back to the raw (possibly comma-joined) config value.
+        assert token != adapter.config.token
 
-    def test_no_url_match_falls_back_to_primary_token(self, adapter):
+    def test_no_url_match_falls_back_to_primary_client_token(self, adapter):
         adapter = self._adapter_with_teams(adapter)
-        assert (
-            adapter._resolve_download_token("https://example.com/nofiles", "")
-            == adapter.config.token
-        )
+        adapter._app.client.token = "xoxb-primary-connection"
+        token = adapter._resolve_download_token("https://example.com/nofiles", "")
+        assert token == "xoxb-primary-connection"
+        assert token != adapter.config.token
+
+    def test_no_primary_client_falls_back_to_raw_config_token(self, adapter):
+        """Absolute last resort when there is no live connection at all."""
+        adapter = self._adapter_with_teams(adapter)
+        adapter._connections = []
+        token = adapter._resolve_download_token("https://example.com/nofiles", "")
+        assert token == adapter.config.token
 
     @pytest.mark.asyncio
     async def test_download_uses_owning_workspace_token(self, adapter, monkeypatch):

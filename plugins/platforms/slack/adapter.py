@@ -8303,7 +8303,14 @@ class SlackAdapter(BasePlatformAdapter):
            carried no team info (thread replies / mentions in multi-workspace
            installs). This prevents defaulting to the primary workspace token,
            which makes Slack return an HTML login page instead of file bytes.
-        3. Primary workspace token as a last resort.
+        3. The primary connection's own client token — mirrors ``_get_client()``'s
+           fallback (``:2585``). ``self.config.token`` is the *raw*, unsplit
+           config value; for a multi-workspace install that's a comma-joined
+           ``"xoxb-A,xoxb-B"`` string that Slack never accepts, so it must not
+           be used as a bearer token on its own.
+        4. ``self.config.token`` as an absolute last resort (single-workspace
+           installs only reach this — ``_app``/``_app.client`` unset means we
+           are not connected at all).
         """
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id].token
@@ -8313,6 +8320,12 @@ class SlackAdapter(BasePlatformAdapter):
                 url_team = m.group(1)
                 if url_team in self._team_clients:
                     return self._team_clients[url_team].token
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            primary_token = getattr(self._app.client, "token", None) if self._app else None
+            if primary_token:
+                return primary_token
         except Exception:  # pragma: no cover - defensive
             pass
         return self.config.token or ""
