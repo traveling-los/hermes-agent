@@ -79,7 +79,7 @@ class XAIGrokAdapter(UpstreamAdapter):
         failed_credential: UpstreamCredential,
         status_code: int,
     ) -> Optional[UpstreamCredential]:
-        if status_code not in {401, 429}:
+        if status_code not in {401, 403, 429}:
             return None
 
         with self._lock:
@@ -87,7 +87,12 @@ class XAIGrokAdapter(UpstreamAdapter):
             if pool is None:
                 return None
 
-            if status_code == 429:
+            # 403: xAI's explicit personal-team-blocked:spending-limit code
+            # (see error_classifier._XAI_SPENDING_LIMIT_ERROR_CODE) is an
+            # account-level block, not a stale token — refreshing the same
+            # credential can't fix it, so route straight to rotate like 429
+            # instead of through try_refresh_current(). Patched 2026-07-27.
+            if status_code in (429, 403):
                 # Mark the rate-limited key with its 1-hour cooldown and rotate
                 # to the next available credential. Returns None when the pool
                 # has no other key to offer — the 429 will flow back to the client.
