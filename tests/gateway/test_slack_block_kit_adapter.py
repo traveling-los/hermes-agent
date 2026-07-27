@@ -13,13 +13,17 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.slack import adapter as slack_module
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection
 
 
 def _make_adapter(extra=None):
     config = PlatformConfig(enabled=True, token="xoxb-fake", extra=extra or {})
     a = SlackAdapter(config)
-    a._app = MagicMock()
+    a._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake", app_token="xapp-fake", app=MagicMock()
+        )
+    ]
     client = AsyncMock()
     client.chat_postMessage = AsyncMock(return_value={"ts": "111.222"})
     client.chat_update = AsyncMock(return_value={"ts": "111.222"})

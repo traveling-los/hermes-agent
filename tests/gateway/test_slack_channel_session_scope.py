@@ -26,15 +26,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection
 
 
 @pytest.fixture
 def adapter():
     config = PlatformConfig(enabled=True, token="xoxb-fake-token")
     a = SlackAdapter(config)
-    a._app = MagicMock()
-    a._app.client = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.client = AsyncMock()
+    a._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake-token", app_token="xapp-fake", app=mock_app
+        )
+    ]
     a._bot_user_id = "U_BOT"
     a._running = True
     a.handle_message = AsyncMock()

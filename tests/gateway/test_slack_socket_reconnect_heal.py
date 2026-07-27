@@ -60,7 +60,7 @@ import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 
 
@@ -186,19 +186,29 @@ async def _spin() -> None:
 def adapter():
     config = PlatformConfig(enabled=True, token="xoxb-fake-token")
     a = SlackAdapter(config)
-    a._app = MagicMock()
-    a._app_token = "xapp-fake"
+    # Socket Mode state lives per workspace on ``_WorkspaceConnection`` now;
+    # ``_app`` is a read-only property over ``_connections``.
+    a._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake-token", app_token="xapp-fake", app=MagicMock()
+        )
+    ]
     a._proxy_url = None
     a._running = True
     a.handle_message = AsyncMock()
     return a
 
 
+def _conn(adapter):
+    return adapter._connections[0]
+
+
 def _attach(adapter, handler):
     """Wire a handler into the adapter the way _start_socket_mode_handler does."""
-    adapter._handler = handler
+    conn = _conn(adapter)
+    conn.handler = handler
     task = asyncio.create_task(handler.start_async())
-    adapter._socket_mode_task = task
+    conn.socket_task = task
     return task
 
 
@@ -221,7 +231,7 @@ class TestSocketModeTeardown:
         # Let the task settle into the retry loop.
         await asyncio.sleep(0.01)
 
-        await adapter._stop_socket_mode_handler()
+        await adapter._stop_socket_mode_handler(_conn(adapter))
         # Give anything that survived a chance to make itself known.
         await asyncio.sleep(0.03)
 
@@ -251,7 +261,7 @@ class TestSocketModeTeardown:
         _attach(adapter, handler)
         await asyncio.sleep(0.01)
 
-        await adapter._stop_socket_mode_handler()
+        await adapter._stop_socket_mode_handler(_conn(adapter))
         await asyncio.sleep(0.03)
 
         for name in (
@@ -285,7 +295,7 @@ class TestSocketModeTeardown:
         # Let both reconnect loops settle inside connect().
         await asyncio.sleep(0.01)
 
-        await adapter._stop_socket_mode_handler()
+        await adapter._stop_socket_mode_handler(_conn(adapter))
         await asyncio.sleep(0.03)
 
         session = client.aiohttp_client_session
@@ -306,10 +316,10 @@ class TestSocketModeTeardown:
         _attach(adapter, handler)
         await asyncio.sleep(0.01)
 
-        await adapter._stop_socket_mode_handler()
+        await adapter._stop_socket_mode_handler(_conn(adapter))
 
-        assert adapter._handler is None
-        assert adapter._socket_mode_task is None
+        assert _conn(adapter).handler is None
+        assert _conn(adapter).socket_task is None
 
 
 class TestSocketModeRestart:
@@ -322,7 +332,7 @@ class TestSocketModeRestart:
 
         started: list[str] = []
 
-        def _fake_start() -> None:
+        def _fake_start(conn) -> None:
             started.append("started")
             assert old_task.done(), (
                 "the replacement handler was created while the old socket task "
@@ -330,7 +340,7 @@ class TestSocketModeRestart:
             )
 
         with patch.object(adapter, "_start_socket_mode_handler", _fake_start):
-            await adapter._restart_socket_mode("transport disconnected")
+            await adapter._restart_socket_mode(_conn(adapter), "transport disconnected")
 
         await asyncio.sleep(0.03)
 
@@ -342,11 +352,11 @@ class TestSocketModeRestart:
         """The existing watchdog triggers still fire after the teardown change."""
         done_task = MagicMock()
         done_task.done.return_value = True
-        adapter._socket_mode_task = done_task
+        _conn(adapter).socket_task = done_task
 
         reasons: list[str] = []
 
-        async def _fake_restart(reason: str) -> None:
+        async def _fake_restart(conn, reason: str) -> None:
             reasons.append(reason)
             adapter._running = False
 
@@ -363,12 +373,12 @@ class TestSocketModeRestart:
         """A transport that reports itself down still triggers a reconnect."""
         live_task = MagicMock()
         live_task.done.return_value = False
-        adapter._socket_mode_task = live_task
-        adapter._handler = MagicMock()
+        _conn(adapter).socket_task = live_task
+        _conn(adapter).handler = MagicMock()
 
         reasons: list[str] = []
 
-        async def _fake_restart(reason: str) -> None:
+        async def _fake_restart(conn, reason: str) -> None:
             reasons.append(reason)
             adapter._running = False
 

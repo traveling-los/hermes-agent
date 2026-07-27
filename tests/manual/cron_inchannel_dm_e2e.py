@@ -38,7 +38,10 @@ os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="cron_dm_e2e_")
 import cron.scheduler as sched  # noqa: E402
 from gateway.config import PlatformConfig, Platform  # noqa: E402
 from gateway.session import build_session_key, SessionSource  # noqa: E402
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
 
 DM_CHAT = "D_TESTDM"
 BOT = "U_TESTBOT"
@@ -51,8 +54,13 @@ async def _inbound_dm_reply_key(dm_threads_as_sessions: bool):
     cfg = PlatformConfig(enabled=True, token="xoxb-test-not-real")
     cfg.extra["dm_top_level_threads_as_sessions"] = dm_threads_as_sessions
     a = SlackAdapter(cfg)
-    a._app = MagicMock()
-    a._app.client = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.client = AsyncMock()
+    a._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-test-not-real", app_token="xapp-fake", app=mock_app
+        )
+    ]
     a._bot_user_id = BOT
     a._running = True
 

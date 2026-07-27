@@ -152,7 +152,11 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    # WhatsApp Baileys: progress/interim land as permanent WA bubbles (Carlos
+    # master channel is high-signal EA only). Keep TIER_LOW even if /edit exists
+    # — tool-progress + interim spam is worse than quiet turns. Profile may still
+    # force display.platforms.whatsapp.* off explicitly.
+    "whatsapp":        _TIER_LOW,
     # WhatsApp Cloud API: Meta added message editing in 2023 but the
     # Hermes Cloud adapter doesn't implement edit_message yet, so we
     # stay on TIER_LOW (tool_progress off) to avoid spamming each

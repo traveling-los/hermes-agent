@@ -48,7 +48,26 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection
+
+
+def _install_slack_app(adapter, app=None):
+    """Give ``adapter`` one mocked workspace connection.
+
+    ``SlackAdapter._app`` is a read-only property over ``_connections`` since
+    the multi-workspace Socket Mode refactor, so tests install a
+    ``_WorkspaceConnection`` instead of assigning ``adapter._app``.
+    """
+    if app is None:
+        app = MagicMock()
+        app.client = AsyncMock()
+    adapter._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake", app_token="xapp-fake", app=app
+        )
+    ]
+    return app
+
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +77,7 @@ from plugins.platforms.slack.adapter import SlackAdapter
 def _make_adapter():
     config = PlatformConfig(enabled=True, token="xoxb-fake")
     a = SlackAdapter(config)
-    a._app = MagicMock()
+    _install_slack_app(a)
     a._bot_user_id = "U_BOT"
     a._running = True
     return a

@@ -502,7 +502,10 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
 
 
 class TestSlackMultiImage:
@@ -510,7 +513,11 @@ class TestSlackMultiImage:
     def adapter(self):
         config = PlatformConfig(enabled=True, token="xoxb-fake")
         a = SlackAdapter(config)
-        a._app = MagicMock()
+        a._connections = [
+            _WorkspaceConnection(
+                bot_token="xoxb-fake", app_token="xapp-fake", app=MagicMock()
+            )
+        ]
         a._resolve_thread_ts = MagicMock(return_value=None)
         a._record_uploaded_file_thread = MagicMock()
         client = MagicMock()

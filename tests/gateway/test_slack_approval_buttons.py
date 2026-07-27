@@ -42,7 +42,7 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection
 from gateway.config import PlatformConfig, Platform
 
 
@@ -50,7 +50,11 @@ def _make_adapter():
     """Create a SlackAdapter instance with mocked internals."""
     config = PlatformConfig(enabled=True, token="xoxb-test-token")
     adapter = SlackAdapter(config)
-    adapter._app = MagicMock()
+    adapter._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-test-token", app_token="xapp-test", app=MagicMock()
+        )
+    ]
     adapter._bot_user_id = "U_BOT"
     adapter._team_clients = {"T1": AsyncMock()}
     adapter._team_bot_user_ids = {"T1": "U_BOT"}
@@ -158,7 +162,7 @@ class TestSlackExecApproval:
     @pytest.mark.asyncio
     async def test_not_connected(self):
         adapter = _make_adapter()
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_exec_approval(
             chat_id="C1", command="ls", session_key="s"
         )
@@ -1105,9 +1109,65 @@ class TestThreadEngagement:
 
         await adapter.send(chat_id="C1", content="Hello!", metadata={"thread_id": "8000.0"})
 
+        # No workspace on the outbound metadata, so the tracked marker is the
+        # bare ts (``_workspace_message_marker``); the inbound membership
+        # check tries the scoped marker first and falls back to bare, so a
+        # bare-stored root still wakes the bot — see
+        # ``test_bare_stored_ts_matched_by_scoped_check`` below.
         assert "9000.1" in adapter._bot_message_ts
         # Thread root should also be tracked
         assert "8000.0" in adapter._bot_message_ts
+
+    @pytest.mark.asyncio
+    async def test_send_with_workspace_metadata_scopes_ts(self):
+        """With an explicit workspace on the metadata, the tracked marker is
+        workspace-scoped so the same ts in another workspace cannot collide
+        with it (Slack ts values are only unique within one workspace)."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "9100.1"})
+
+        await adapter.send(
+            chat_id="C1",
+            content="Hello!",
+            metadata={"thread_id": "8100.0", "team_id": "T1"},
+        )
+
+        assert adapter._workspace_message_marker("T1", "9100.1") in adapter._bot_message_ts
+        assert adapter._workspace_message_marker("T1", "8100.0") in adapter._bot_message_ts
+        # A different workspace's identical ts must NOT match.
+        assert (
+            adapter._workspace_message_marker("T2", "9100.1")
+            not in adapter._bot_message_ts
+        )
+
+    @pytest.mark.asyncio
+    async def test_bare_stored_ts_matched_by_scoped_check(self):
+        """A ts stored bare (residual add path where no workspace resolved)
+        must still be matched by the inbound membership check even when the
+        event carries a team_id — the check falls back to the bare key."""
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter.handle_message = AsyncMock()
+        adapter._bot_message_ts.add("5000.0")  # bare: stored with no team
+
+        event = {
+            "text": "follow-up without mention",
+            "user": "U_USER",
+            "channel": "C1",
+            "ts": "5000.1",
+            "thread_ts": "5000.0",
+            "channel_type": "channel",
+            "team": "T1",
+        }
+        with patch.object(
+            adapter, "_has_active_session_for_thread", return_value=False
+        ), patch.object(
+            adapter, "_fetch_thread_context", new_callable=AsyncMock, return_value=""
+        ):
+            await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
 
     def test_bot_message_ts_cap_evicts_oldest_timestamps(self):
         """Bot thread tracking evicts the oldest Slack timestamps first."""

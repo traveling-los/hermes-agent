@@ -350,13 +350,19 @@ class TestBridgeEventMetadata:
 # ---------------------------------------------------------------------------
 
 class TestWhatsAppTier:
-    """WhatsApp should be classified as TIER_MEDIUM."""
+    """WhatsApp (Baileys) is deliberately classified as TIER_LOW.
 
-    def test_whatsapp_streaming_follows_global(self):
-        from gateway.display_config import resolve_display_setting
-        # TIER_MEDIUM has streaming: None (follow global), not False
-        assert resolve_display_setting({}, "whatsapp", "streaming") is None
+    The Baileys bridge does support /edit, which would qualify it for
+    TIER_MEDIUM, but progress and interim turns still land as permanent
+    WhatsApp bubbles — so tool progress and streaming are quiet by default.
+    See the ``_PLATFORM_DEFAULTS`` comment in ``gateway/display_config.py``.
+    """
 
-    def test_whatsapp_tool_progress_is_new(self):
+    def test_whatsapp_streaming_is_off(self):
         from gateway.display_config import resolve_display_setting
-        assert resolve_display_setting({}, "whatsapp", "tool_progress") == "new"
+        # TIER_LOW pins streaming off rather than following the global default.
+        assert resolve_display_setting({}, "whatsapp", "streaming") is False
+
+    def test_whatsapp_tool_progress_is_off(self):
+        from gateway.display_config import resolve_display_setting
+        assert resolve_display_setting({}, "whatsapp", "tool_progress") == "off"

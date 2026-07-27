@@ -587,15 +587,21 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
 from gateway.config import PlatformConfig  # noqa: E402
 
 
 def _make_slack_adapter():
     config = PlatformConfig(enabled=True, token="***")
     adapter = SlackAdapter(config)
-    adapter._app = MagicMock()
-    adapter._app.client = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.client = AsyncMock()
+    adapter._connections = [
+        _WorkspaceConnection(bot_token="***", app_token="xapp-fake", app=mock_app)
+    ]
     adapter._bot_user_id = "U_BOT"
     adapter._running = True
     return adapter

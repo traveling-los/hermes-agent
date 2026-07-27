@@ -97,7 +97,28 @@ import plugins.platforms.slack.adapter as _slack_mod
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
+
+
+def _install_mock_app(adapter, app=None, **conn_kwargs):
+    """Test helper: give ``adapter`` a single mocked workspace connection.
+
+    Mirrors what ``connect()`` would populate, so tests that used to poke
+    the old singleton ``adapter._app = MagicMock()`` can instead go through
+    ``adapter._connections[0]`` — ``_app`` is now a read-only property
+    over ``_connections`` (multi-workspace Socket Mode refactor).
+    """
+    if app is None:
+        app = MagicMock()
+        app.client = AsyncMock()
+    conn_kwargs.setdefault("bot_token", "xoxb-fake-token")
+    conn_kwargs.setdefault("app_token", "xapp-fake")
+    conn = _WorkspaceConnection(app=app, **conn_kwargs)
+    adapter._connections = [conn]
+    return conn
 
 
 def test_slack_mock_bootstrap_preserves_installed_packages():
@@ -123,8 +144,7 @@ class TestIgnoredChannelOutboundSuppression:
             extra={"ignored_channels": ["C_PRD"]},
         )
         adapter = SlackAdapter(config)
-        adapter._app = MagicMock()
-        adapter._app.client = AsyncMock()
+        _install_mock_app(adapter)
         adapter._bot_user_id = "U_BOT"
         adapter._running = True
         return adapter
@@ -223,8 +243,7 @@ def adapter():
     config = PlatformConfig(enabled=True, token="***")
     a = SlackAdapter(config)
     # Mock the Slack app client
-    a._app = MagicMock()
-    a._app.client = AsyncMock()
+    _install_mock_app(a)
     a._app.client.users_info = AsyncMock(
         return_value={
             "user": {
@@ -735,7 +754,11 @@ class TestSlackConnectCleanup:
 
         assert result is False
         mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
-        assert adapter._platform_lock_identity is None
+        # Multi-socket connect() tracks acquired locks in
+        # ``_socket_lock_identities`` (released via
+        # ``_release_all_socket_locks``) rather than the single-identity
+        # ``_platform_lock_identity`` the base-class helper uses.
+        assert adapter._socket_lock_identities == []
 
     @pytest.mark.asyncio
     async def test_reconnect_closes_previous_handler_to_prevent_zombie_socket(self):
@@ -752,7 +775,7 @@ class TestSlackConnectCleanup:
         # Simulate state left over from a prior connect() call.
         first_handler = AsyncMock()
         first_handler.close_async = AsyncMock()
-        adapter._handler = first_handler
+        _install_mock_app(adapter, handler=first_handler)
 
         mock_app = MagicMock()
 
@@ -799,7 +822,7 @@ class TestSlackConnectCleanup:
 
         assert result is True
         first_handler.close_async.assert_awaited_once_with()
-        assert adapter._handler is second_handler
+        assert adapter._connections[0].handler is second_handler
 
         with patch("gateway.status.release_scoped_lock"):
             await adapter.disconnect()
@@ -825,17 +848,22 @@ class TestSlackConnectCleanup:
         team_client = MagicMock()
         team_client.close = AsyncMock(return_value=None)
 
+        app = MagicMock()
+        app.client = primary_client
+        conn = _WorkspaceConnection(
+            bot_token="xoxb-fake",
+            app_token="xapp-fake",
+            app=app,
+            handler=handler,
+            socket_task=socket_task,
+        )
+
         adapter._running = True
-        adapter._handler = handler
-        adapter._socket_mode_task = socket_task
-        adapter._app = MagicMock()
-        adapter._app.client = primary_client
+        adapter._connections = [conn]
         adapter._team_clients = {"T_FAKE": team_client}
         adapter._team_bot_user_ids = {"T_FAKE": "U_BOT"}
         adapter._channel_team = {"C_FAKE": "T_FAKE"}
-        adapter._platform_lock_scope = "slack-app-token"
-        adapter._platform_lock_identity = "xapp-fake"
-        adapter._app_token = "xapp-fake"
+        adapter._socket_lock_identities = ["xapp-fake"]
         adapter._proxy_url = "http://proxy.example.com:3128"
         adapter._bot_user_id = "U_BOT"
 
@@ -847,14 +875,15 @@ class TestSlackConnectCleanup:
         team_client.close.assert_awaited_once_with()
         assert socket_task.cancelled()
         assert adapter._app is None
-        assert adapter._handler is None
-        assert adapter._socket_mode_task is None
+        assert adapter._connections == []
+        assert conn.handler is None
+        assert conn.socket_task is None
         assert adapter._team_clients == {}
         assert adapter._team_bot_user_ids == {}
         assert adapter._channel_team == {}
         assert adapter._bot_user_id is None
-        assert adapter._app_token is None
         assert adapter._proxy_url is None
+        assert adapter._socket_lock_identities == []
         mock_release.assert_called_once_with("slack-app-token", "xapp-fake")
 
 
@@ -961,7 +990,7 @@ class TestSlackSocketWatchdog:
                 assert len(instances) >= 2, "watchdog/done_callback did not reconnect"
                 assert instances[0].closed is True
                 assert instances[-1].start_calls == 1
-                assert adapter._handler is instances[-1]
+                assert adapter._connections[0].handler is instances[-1]
             finally:
                 await adapter.disconnect()
 
@@ -988,7 +1017,7 @@ class TestSlackSocketWatchdog:
 
                 assert len(instances) >= 2, "watchdog did not heal dead transport"
                 assert instances[0].closed is True
-                assert adapter._handler is instances[-1]
+                assert adapter._connections[0].handler is instances[-1]
             finally:
                 await adapter.disconnect()
 
@@ -1007,8 +1036,7 @@ class TestSlackSocketWatchdog:
 
             await adapter.disconnect()
 
-            assert adapter._handler is None
-            assert adapter._socket_mode_task is None
+            assert adapter._connections == []
             assert adapter._socket_watchdog_task is None
             assert instances[0].closed is True
 
@@ -1157,9 +1185,10 @@ class TestSlackSocketWatchdog:
                 assert await adapter.connect() is True
                 baseline = len(instances)
 
+                conn = adapter._connections[0]
                 await asyncio.gather(
-                    adapter._restart_socket_mode("watchdog"),
-                    adapter._restart_socket_mode("done-callback"),
+                    adapter._restart_socket_mode(conn, "watchdog"),
+                    adapter._restart_socket_mode(conn, "done-callback"),
                 )
 
                 new_handlers = len(instances) - baseline
@@ -1173,50 +1202,86 @@ class TestSlackSocketWatchdog:
     # -- ping/pong staleness: heals the wedged transport that is_connected() misses --
 
     def _adapter_with_fake_client(self, **client_attrs):
+        """Adapter + one workspace connection whose handler has a faked client.
+
+        Ping/pong staleness is evaluated per ``_WorkspaceConnection`` now, so
+        the fake handler hangs off the connection rather than the adapter.
+        """
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         client = MagicMock()
         for key, value in client_attrs.items():
             setattr(client, key, value)
-        adapter._handler = MagicMock(client=client)
-        return adapter
+        conn = _WorkspaceConnection(
+            bot_token="xoxb-fake",
+            app_token="xapp-fake",
+            handler=MagicMock(client=client),
+        )
+        adapter._connections = [conn]
+        return adapter, conn
 
     def test_ping_pong_stale_when_last_ping_old(self):
-        adapter = self._adapter_with_fake_client(
+        adapter, conn = self._adapter_with_fake_client(
             ping_interval=30, last_ping_pong_time=time.time() - 1000
         )
-        assert adapter._socket_ping_pong_stale() is True
+        assert adapter._socket_ping_pong_stale(conn) is True
 
     def test_ping_pong_fresh_when_last_ping_recent(self):
-        adapter = self._adapter_with_fake_client(
+        adapter, conn = self._adapter_with_fake_client(
             ping_interval=30, last_ping_pong_time=time.time() - 5
         )
-        assert adapter._socket_ping_pong_stale() is False
+        assert adapter._socket_ping_pong_stale(conn) is False
 
     def test_ping_pong_none_within_grace_not_stale(self):
-        adapter = self._adapter_with_fake_client(
+        adapter, conn = self._adapter_with_fake_client(
             ping_interval=30, last_ping_pong_time=None
         )
-        adapter._socket_handler_started_monotonic = time.monotonic()
-        assert adapter._socket_ping_pong_stale() is False
+        conn.handler_started_monotonic = time.monotonic()
+        assert adapter._socket_ping_pong_stale(conn) is False
 
     def test_ping_pong_none_beyond_grace_is_stale(self):
-        adapter = self._adapter_with_fake_client(
+        adapter, conn = self._adapter_with_fake_client(
             ping_interval=30, last_ping_pong_time=None
         )
         adapter._socket_first_ping_grace_s = 0.0
-        adapter._socket_handler_started_monotonic = time.monotonic() - 200
-        assert adapter._socket_ping_pong_stale() is True
+        conn.handler_started_monotonic = time.monotonic() - 200
+        assert adapter._socket_ping_pong_stale(conn) is True
+
+    def test_ping_pong_grace_is_per_workspace(self):
+        """One workspace's fresh reconnect must not reset another's grace."""
+        adapter, stale_conn = self._adapter_with_fake_client(
+            ping_interval=30, last_ping_pong_time=None
+        )
+        adapter._socket_first_ping_grace_s = 0.0
+        stale_conn.handler_started_monotonic = time.monotonic() - 200
+
+        fresh_client = MagicMock()
+        fresh_client.ping_interval = 30
+        fresh_client.last_ping_pong_time = None
+        fresh_conn = _WorkspaceConnection(
+            bot_token="xoxb-2",
+            app_token="xapp-2",
+            handler=MagicMock(client=fresh_client),
+            handler_started_monotonic=time.monotonic(),
+        )
+        adapter._connections.append(fresh_conn)
+
+        assert adapter._socket_ping_pong_stale(stale_conn) is True
+        assert adapter._socket_ping_pong_stale(fresh_conn) is False
 
     def test_ping_pong_no_handler_not_stale(self):
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
-        adapter._handler = None
-        assert adapter._socket_ping_pong_stale() is False
+        conn = _WorkspaceConnection(bot_token="xoxb-fake", app_token="xapp-fake")
+        adapter._connections = [conn]
+        assert adapter._socket_ping_pong_stale(conn) is False
 
     def test_ping_pong_nonnumeric_attrs_not_stale(self):
         # A mocked/partial client (MagicMock attrs) must never trigger reconnect.
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
-        adapter._handler = MagicMock()
-        assert adapter._socket_ping_pong_stale() is False
+        conn = _WorkspaceConnection(
+            bot_token="xoxb-fake", app_token="xapp-fake", handler=MagicMock()
+        )
+        adapter._connections = [conn]
+        assert adapter._socket_ping_pong_stale(conn) is False
 
     @pytest.mark.asyncio
     async def test_watchdog_reconnects_when_ping_pong_stale_despite_is_connected_true(self):
@@ -1245,7 +1310,7 @@ class TestSlackSocketWatchdog:
 
                 assert len(instances) >= 2, "watchdog did not heal wedged (lying) transport"
                 assert instances[0].closed is True
-                assert adapter._handler is instances[-1]
+                assert adapter._connections[0].handler is instances[-1]
             finally:
                 await adapter.disconnect()
 
@@ -1387,9 +1452,12 @@ class TestSlackProxyBehavior:
             client.proxy == "http://proxy.example.com:3128"
             for client in created_clients
         )
-        assert adapter._handler is not None
-        assert adapter._handler.proxy == "http://proxy.example.com:3128"
-        assert adapter._handler.client.proxy == "http://proxy.example.com:3128"
+        assert adapter._connections[0].handler is not None
+        assert adapter._connections[0].handler.proxy == "http://proxy.example.com:3128"
+        assert (
+            adapter._connections[0].handler.client.proxy
+            == "http://proxy.example.com:3128"
+        )
         assert "hermes_feedback" in created_apps[0].registered_actions
         assert "hermes_clarify_other" in created_apps[0].registered_actions
         clarify_choice_patterns = [
@@ -1494,9 +1562,9 @@ class TestSlackProxyBehavior:
         assert result is True
         assert created_apps[0].client.proxy is None
         assert all(client.proxy is None for client in created_clients)
-        assert adapter._handler is not None
-        assert adapter._handler.proxy is None
-        assert adapter._handler.client.proxy is None
+        assert adapter._connections[0].handler is not None
+        assert adapter._connections[0].handler.proxy is None
+        assert adapter._connections[0].handler.client.proxy is None
 
 
 # ---------------------------------------------------------------------------
@@ -1824,7 +1892,7 @@ class TestSendDocument:
 
     @pytest.mark.asyncio
     async def test_send_document_not_connected(self, adapter):
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_document(
             chat_id="C123",
             file_path="/some/file.pdf",
@@ -1967,7 +2035,7 @@ class TestSendVideo:
 
     @pytest.mark.asyncio
     async def test_send_video_not_connected(self, adapter):
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.send_video(
             chat_id="C123",
             video_path="/some/video.mp4",
@@ -3569,8 +3637,7 @@ class TestSendTyping:
             typing_status_text="is pouncing… 🐾",
         )
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
@@ -3601,8 +3668,7 @@ class TestSendTyping:
             typing_status_text="is pouncing… 🐾",
         )
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._app.client.assistant_threads_setStatus = AsyncMock()
         a.set_status_text("C123", "is reading docs/api.md…")
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
@@ -4584,7 +4650,9 @@ class TestDeleteMessage:
 
     @pytest.mark.asyncio
     async def test_delete_message_returns_false_when_not_connected(self, adapter):
-        adapter._app = None
+        # ``_app`` is a read-only property over ``_connections`` now, so
+        # "not connected" means no workspace connections at all.
+        adapter._connections = []
 
         assert await adapter.delete_message("C123", "1234.5678") is False
 
@@ -4730,7 +4798,7 @@ class TestEditMessageStreamingPipeline:
     @pytest.mark.asyncio
     async def test_edit_message_not_connected(self, adapter):
         """edit_message returns failure when adapter is not connected."""
-        adapter._app = None
+        adapter._connections = []
         result = await adapter.edit_message("C123", "ts1", "**hello**")
         assert result.success is False
         assert "Not connected" in result.error
@@ -4964,8 +5032,7 @@ class TestThreadReplyHandling:
         """Create an adapter with a mock session store attached."""
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {
@@ -5363,8 +5430,7 @@ class TestAssistantThreadLifecycle:
     def assistant_adapter(self, mock_session_store):
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {
@@ -8240,8 +8306,7 @@ class TestThreadImageContext:
     def adapter_with_session_store(self, mock_session_store):
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_mock_app(a)
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {

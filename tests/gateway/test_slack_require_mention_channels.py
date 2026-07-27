@@ -48,7 +48,24 @@ import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter, _apply_yaml_config, _WorkspaceConnection  # noqa: E402
+def _install_slack_app(adapter, app=None):
+    """Give ``adapter`` one mocked workspace connection.
+
+    ``SlackAdapter._app`` is a read-only property over ``_connections`` since
+    the multi-workspace Socket Mode refactor, so tests install a
+    ``_WorkspaceConnection`` instead of assigning ``adapter._app``.
+    """
+    if app is None:
+        app = MagicMock()
+        app.client = AsyncMock()
+    adapter._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake", app_token="xapp-fake", app=app
+        )
+    ]
+    return app
+
 
 BOT_USER_ID = "U_BOT"
 CHANNEL_ID = "C_FORCED"
@@ -73,8 +90,7 @@ def _clean_env(monkeypatch, tmp_path):
 def adapter():
     config = PlatformConfig(enabled=True, token="xoxb-fake-token")
     a = SlackAdapter(config)
-    a._app = MagicMock()
-    a._app.client = AsyncMock()
+    _install_slack_app(a)
     a._app.client.users_info = AsyncMock(
         return_value={
             "user": {

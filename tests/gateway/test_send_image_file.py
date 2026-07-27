@@ -319,7 +319,10 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _WorkspaceConnection,
+)
 
 
 class TestSlackSendImageFile:
@@ -327,7 +330,11 @@ class TestSlackSendImageFile:
     def adapter(self):
         config = PlatformConfig(enabled=True, token="xoxb-fake")
         a = SlackAdapter(config)
-        a._app = MagicMock()
+        a._connections = [
+            _WorkspaceConnection(
+                bot_token="xoxb-fake", app_token="xapp-fake", app=MagicMock()
+            )
+        ]
         return a
 
     def test_sends_local_image_via_upload(self, adapter, tmp_path):
@@ -357,7 +364,7 @@ class TestSlackSendImageFile:
         assert "not found" in result.error
 
     def test_returns_error_when_not_connected(self, adapter):
-        adapter._app = None
+        adapter._connections = []
         result = _run(
             adapter.send_image_file(chat_id="C12345", image_path="/tmp/img.png")
         )

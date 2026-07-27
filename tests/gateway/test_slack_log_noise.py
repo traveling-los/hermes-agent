@@ -62,7 +62,24 @@ import plugins.platforms.slack.adapter as _slack_mod  # noqa: E402
 
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection  # noqa: E402
+def _install_slack_app(adapter, app=None):
+    """Give ``adapter`` one mocked workspace connection.
+
+    ``SlackAdapter._app`` is a read-only property over ``_connections`` since
+    the multi-workspace Socket Mode refactor, so tests install a
+    ``_WorkspaceConnection`` instead of assigning ``adapter._app``.
+    """
+    if app is None:
+        app = MagicMock()
+        app.client = AsyncMock()
+    adapter._connections = [
+        _WorkspaceConnection(
+            bot_token="xoxb-fake", app_token="xapp-fake", app=app
+        )
+    ]
+    return app
+
 from gateway.config import PlatformConfig  # noqa: E402
 
 ADAPTER_LOGGER = "plugins.platforms.slack.adapter"
@@ -201,8 +218,7 @@ class TestInboundLogPrivacy:
     def _make_adapter(self):
         config = PlatformConfig(enabled=True, token="***")
         a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
+        _install_slack_app(a)
         a._bot_user_id = "U_BOT"
         a._running = True
         a.handle_message = AsyncMock()
@@ -300,7 +316,7 @@ class TestClarifyLogPrivacy:
 
         config = PlatformConfig(enabled=True, token="xoxb-test-token")
         adapter = SlackAdapter(config)
-        adapter._app = MagicMock()
+        _install_slack_app(adapter)
         adapter._bot_user_id = "U_BOT"
         adapter._team_clients = {"T1": AsyncMock()}
         adapter._team_bot_user_ids = {"T1": "U_BOT"}
