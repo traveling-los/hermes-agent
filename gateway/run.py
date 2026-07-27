@@ -19140,18 +19140,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
 
+                # Redirect the prompt itself to an internal/admin channel when
+                # approvals.notify_channel is configured. Customer-facing bot
+                # profiles (Slack/WhatsApp) must never surface a raw command +
+                # security-scan finding to the end user; default (unset) keeps
+                # prompting in the triggering channel, unchanged.
+                _approval_adapter = _status_adapter
+                _approval_chat_id = _status_chat_id
+                _approval_thread_metadata = _status_thread_metadata
+                try:
+                    from hermes_cli.config import load_config as _load_notify_cfg
+
+                    _notify_cfg = cfg_get(
+                        _load_notify_cfg(), "approvals", "notify_channel", default={}
+                    ) or {}
+                    _notify_platform_raw = str(_notify_cfg.get("platform") or "").strip().lower()
+                    _notify_chat_id = str(_notify_cfg.get("chat_id") or "").strip()
+                    if _notify_platform_raw and _notify_chat_id:
+                        _notify_platform = Platform(_notify_platform_raw)
+                        _already_target = (
+                            source.platform == _notify_platform
+                            and str(_status_chat_id) == _notify_chat_id
+                        )
+                        if not _already_target:
+                            _override_adapter = self._authorization_adapter(
+                                _notify_platform, getattr(source, "profile", None)
+                            )
+                            if _override_adapter is not None:
+                                _approval_adapter = _override_adapter
+                                _approval_chat_id = _notify_chat_id
+                                _approval_thread_metadata = None
+                except Exception:
+                    logger.debug(
+                        "approvals.notify_channel resolution failed", exc_info=True
+                    )
+
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
-                if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
+                if getattr(type(_approval_adapter), "send_exec_approval", None) is not None:
                     try:
                         _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
+                            _approval_adapter.send_exec_approval(
+                                chat_id=_approval_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_thread_metadata,
                                 allow_permanent=approval_data.get("allow_permanent", True),
                                 smart_denied=approval_data.get("smart_denied", False),
                             ),
@@ -19177,7 +19212,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # typed prefix so Slack/Matrix users are told the form they
                 # can actually type (`!approve`) — typed "/" is blocked in
                 # Slack threads and reserved by Matrix clients.
-                _p = getattr(_status_adapter, "typed_command_prefix", "/")
+                _p = getattr(_approval_adapter, "typed_command_prefix", "/")
                 msg = _format_exec_approval_fallback(
                     cmd,
                     desc,
@@ -19187,10 +19222,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
-                        _status_adapter.send(
-                            _status_chat_id,
+                        _approval_adapter.send(
+                            _approval_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=_approval_thread_metadata,
                         ),
                         _loop_for_step,
                         logger=logger,

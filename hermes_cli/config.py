@@ -2610,6 +2610,17 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+        # Redirect approval-request prompts to an internal/admin chat instead
+        # of the channel that triggered the dangerous command. Required for
+        # customer-facing bot profiles (Slack/WhatsApp) where a raw command +
+        # security-scan finding must never reach the end user. Leave both
+        # fields blank (default) to keep prompting in the triggering channel.
+        #   platform: gateway.config.Platform value, e.g. "slack", "telegram"
+        #   chat_id:  channel/DM id on that platform
+        "notify_channel": {
+            "platform": "",
+            "chat_id": "",
+        },
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)
