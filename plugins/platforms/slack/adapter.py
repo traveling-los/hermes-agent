@@ -1030,6 +1030,12 @@ class SlackAdapter(BasePlatformAdapter):
         # mentions-mode gateway actually receives them (prompt-based mention
         # compliance proved unreliable across fleet agents).
         self._a2a_bot_requesters: dict[str, str] = {}
+        # A2A hard brake: admitted-bot messages processed per thread. Two LLM
+        # agents plus auto-mentions can courtesy-ping-pong indefinitely
+        # (observed 30+ msgs Vinny↔Ady 2026-07-28); past the budget, bot
+        # messages in that thread are dropped silently. Humans are unaffected.
+        self._a2a_thread_bot_msgs: dict[str, int] = {}
+        self._A2A_THREAD_BOT_BUDGET = 6
         # Track threads where the bot has been @mentioned — once mentioned,
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set[str] = set()
@@ -5625,6 +5631,21 @@ class SlackAdapter(BasePlatformAdapter):
                 if len(self._a2a_bot_requesters) > 500:
                     for _k in list(self._a2a_bot_requesters)[:250]:
                         self._a2a_bot_requesters.pop(_k, None)
+                # Hard brake: past the per-thread budget, drop bot messages.
+                _n = self._a2a_thread_bot_msgs.get(a2a_key, 0) + 1
+                self._a2a_thread_bot_msgs[a2a_key] = _n
+                if len(self._a2a_thread_bot_msgs) > 500:
+                    for _k in list(self._a2a_thread_bot_msgs)[:250]:
+                        self._a2a_thread_bot_msgs.pop(_k, None)
+                if _n > self._A2A_THREAD_BOT_BUDGET:
+                    logger.info(
+                        "[Slack] A2A thread budget exhausted (%d>%d) — "
+                        "dropping bot message in %s",
+                        _n,
+                        self._A2A_THREAD_BOT_BUDGET,
+                        event.get("channel", ""),
+                    )
+                    return
 
         # Ignore message deletions. Edits are normalized above so an @mention
         # added by edit can still wake the bot once.
