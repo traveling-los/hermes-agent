@@ -5573,16 +5573,29 @@ class SlackAdapter(BasePlatformAdapter):
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                # Multi-workspace: ``self._bot_user_id`` is the PRIMARY
+                # workspace's bot user id, so the mention check must resolve
+                # the id for the workspace this event came from or secondary
+                # workspaces never match (e.g. bot-to-bot mentions in a
+                # non-primary workspace were always dropped).
+                team_bot_user_id = (
+                    self._team_bot_user_ids.get(dedup_team_id)
+                    or self._bot_user_id
+                )
+                if team_bot_user_id and f"<@{team_bot_user_id}>" not in text_check:
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
                         "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                        team_bot_user_id,
                     )
                     return
             # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            # Always ignore our own messages to prevent echo loops — match any
+            # of OUR per-workspace bot user ids, not just the primary one.
+            own_bot_ids = set(self._team_bot_user_ids.values())
+            if self._bot_user_id:
+                own_bot_ids.add(self._bot_user_id)
+            if msg_user and msg_user in own_bot_ids:
                 return
 
         # Ignore message deletions. Edits are normalized above so an @mention
