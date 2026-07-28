@@ -1025,6 +1025,11 @@ class SlackAdapter(BasePlatformAdapter):
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set[str] = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
+        # A2A: threads started by an admitted bot (allow_bots) → that bot's
+        # user id. Replies into these threads get the bot @mentioned so its
+        # mentions-mode gateway actually receives them (prompt-based mention
+        # compliance proved unreliable across fleet agents).
+        self._a2a_bot_requesters: dict[str, str] = {}
         # Track threads where the bot has been @mentioned — once mentioned,
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set[str] = set()
@@ -2767,10 +2772,23 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
+            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+
+            # A2A: replying in a thread opened by an admitted bot (allow_bots)
+            # → prepend its @mention so its mentions-mode gateway receives the
+            # reply. Deterministic — prompt-based mention compliance proved
+            # unreliable. No-op for human-opened threads.
+            if thread_ts:
+                _a2a_team = self._metadata_team_id(metadata)
+                _requester = self._a2a_bot_requesters.get(
+                    self._workspace_event_id(_a2a_team, thread_ts)
+                )
+                if _requester and f"<@{_requester}>" not in formatted:
+                    formatted = f"<@{_requester}> {formatted}"
+
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -5597,6 +5615,16 @@ class SlackAdapter(BasePlatformAdapter):
                 own_bot_ids.add(self._bot_user_id)
             if msg_user and msg_user in own_bot_ids:
                 return
+            # A2A: remember the admitted bot behind this conversation so our
+            # reply can @mention it (see send()).
+            if msg_user:
+                a2a_key = self._workspace_event_id(
+                    dedup_team_id, event.get("thread_ts") or event.get("ts", "")
+                )
+                self._a2a_bot_requesters[a2a_key] = msg_user
+                if len(self._a2a_bot_requesters) > 500:
+                    for _k in list(self._a2a_bot_requesters)[:250]:
+                        self._a2a_bot_requesters.pop(_k, None)
 
         # Ignore message deletions. Edits are normalized above so an @mention
         # added by edit can still wake the bot once.
