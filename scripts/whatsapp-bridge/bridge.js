@@ -19,7 +19,7 @@
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, getAggregateVotesInPollMessage, decryptPollVote, getKeyAuthor, jidNormalizedUser, WAMessageStatus } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -38,6 +38,7 @@ import {
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  createSendErrorTracker,
   extractBridgeEvent,
   inferMediaType,
   mediaPayloadForFile,
@@ -272,6 +273,7 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
 const messageStore = createBoundedMessageStore(512);
+const sendErrorTracker = createSendErrorTracker(256);
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -468,6 +470,10 @@ async function startSocket() {
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
+      if (update?.status === WAMessageStatus.ERROR) {
+        sendErrorTracker.record(key, update);
+        continue;
+      }
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -531,6 +537,10 @@ async function startSocket() {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
+      // Any message we see for this chat (inbound or our own echoed send)
+      // proves the privacy token is already established, so future sends
+      // here can skip the delivery-error verification wait.
+      sendErrorTracker.markChatKnownGood(chatId);
       const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
@@ -836,6 +846,17 @@ app.post('/send', async (req, res) => {
       }
     }
 
+    const deliveryError = await sendErrorTracker.checkDelivery(chatId, messageIds);
+    if (deliveryError) {
+      return res.status(502).json({
+        success: false,
+        error: deliveryError.note,
+        code: deliveryError.code,
+        messageId: messageIds[messageIds.length - 1],
+        messageIds,
+      });
+    }
+
     res.json({
       success: true,
       messageId: messageIds[messageIds.length - 1],
@@ -872,6 +893,16 @@ app.post('/edit', async (req, res) => {
           await sleep(CHUNK_DELAY_MS);
         }
       }
+    }
+
+    const editDeliveryError = await sendErrorTracker.checkDelivery(chatId, [messageId, ...messageIds]);
+    if (editDeliveryError) {
+      return res.status(502).json({
+        success: false,
+        error: editDeliveryError.note,
+        code: editDeliveryError.code,
+        messageIds,
+      });
     }
 
     res.json({ success: true, messageIds });
@@ -973,6 +1004,17 @@ app.post('/send-media', async (req, res) => {
     const sent = await sendWithTimeout(chatId, msgPayload);
     trackSentMessageId(sent);
     messageStore.remember(sent);
+
+    const mediaDeliveryError = await sendErrorTracker.checkDelivery(chatId, [sent?.key?.id]);
+    if (mediaDeliveryError) {
+      return res.status(502).json({
+        success: false,
+        error: mediaDeliveryError.note,
+        code: mediaDeliveryError.code,
+        messageId: sent?.key?.id,
+      });
+    }
+
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -997,6 +1039,17 @@ app.post('/send-poll', async (req, res) => {
     const sent = await sendWithTimeout(chatId, payload);
     trackSentMessageId(sent);
     rememberSentMessage(sent, payload);
+
+    const pollDeliveryError = await sendErrorTracker.checkDelivery(chatId, [sent?.key?.id]);
+    if (pollDeliveryError) {
+      return res.status(502).json({
+        success: false,
+        error: pollDeliveryError.note,
+        code: pollDeliveryError.code,
+        messageId: sent?.key?.id,
+      });
+    }
+
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1019,6 +1072,17 @@ app.post('/send-location', async (req, res) => {
     const sent = await sendWithTimeout(chatId, payload);
     trackSentMessageId(sent);
     messageStore.remember(sent);
+
+    const locationDeliveryError = await sendErrorTracker.checkDelivery(chatId, [sent?.key?.id]);
+    if (locationDeliveryError) {
+      return res.status(502).json({
+        success: false,
+        error: locationDeliveryError.note,
+        code: locationDeliveryError.code,
+        messageId: sent?.key?.id,
+      });
+    }
+
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
