@@ -140,10 +140,13 @@ class XAIGrokAdapter(UpstreamAdapter):
         )
         base_url = str(base_url or DEFAULT_XAI_OAUTH_BASE_URL).strip().rstrip("/")
 
+        label = getattr(entry, "label", None) or getattr(entry, "id", None)
+
         return UpstreamCredential(
             bearer=bearer,
             base_url=base_url or DEFAULT_XAI_OAUTH_BASE_URL,
             expires_at=getattr(entry, "expires_at", None),
+            label=str(label) if label else None,
         )
 
 

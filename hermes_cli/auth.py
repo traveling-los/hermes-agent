@@ -4569,6 +4569,35 @@ def _xai_validate_oauth_endpoint(url: str, *, field: str) -> str:
     return url
 
 
+def _is_loopback_host(hostname: Optional[str]) -> bool:
+    """True only for literal loopback hosts — no DNS resolution, ever.
+
+    Used to carve a narrow exemption out of the xAI base_url origin pin so the
+    local Hermes credential proxy (``127.0.0.1:8645``) is reachable without
+    opening the door to arbitrary HTTP endpoints.
+
+    Deliberately excludes anything that would need a name lookup to classify:
+    a hostname that resolves to loopback *today* can resolve elsewhere on the
+    next request (DNS rebinding), which would turn this exemption into the
+    exact credential-exfiltration path the pin exists to prevent. Only the
+    reserved literals ``localhost``, ``127.0.0.0/8`` and ``::1`` qualify.
+    """
+    host = (hostname or "").strip().lower().strip("[]")
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not an IP literal, and we refuse to resolve names — reject.
+        return False
+    except Exception:
+        return False
+
+
 def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     """Refuse a non-xAI base_url for the OAuth-authenticated inference path.
 
@@ -4585,6 +4614,23 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     than raise — a bad env var should not deadlock authentication, but it
     should also never leak the bearer.
 
+    **Loopback exemption.** The one legitimate non-xAI destination is Hermes'
+    own credential proxy (``hermes proxy start --provider xai``), which binds
+    ``127.0.0.1`` and speaks plain HTTP. The threat this function guards
+    against is a bearer travelling over an untrusted network to a third party;
+    a request to a loopback address never leaves the host, and the proxy
+    *replaces* the inbound Authorization header with its own pooled credential
+    before forwarding to xAI over TLS. Without this exemption every profile
+    configured with ``XAI_BASE_URL=http://127.0.0.1:8645/v1`` silently falls
+    back to ``api.x.ai`` direct, which is exactly how the mini's auxiliary
+    roles became invisible to spend attribution (docs/xai-spend-remediation.md).
+
+    The exemption is deliberately narrow: loopback *literals* only
+    (``127.0.0.0/8``, ``::1``, ``localhost``). It does not accept private-LAN
+    addresses, ``0.0.0.0``, or hostnames that merely resolve to loopback —
+    resolution is not stable and a DNS-rebinding trick must not be able to
+    open the hole.
+
     ``value`` is the already-stripped, trailing-slash-trimmed candidate from
     env. Empty input returns ``fallback`` unchanged.
     """
@@ -4599,6 +4645,13 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
             candidate, fallback,
         )
         return fallback
+    if parsed.scheme in {"http", "https"} and _is_loopback_host(parsed.hostname):
+        logger.debug(
+            "Accepting loopback xAI base_url override %r (local Hermes proxy; "
+            "the bearer never leaves this host).",
+            candidate,
+        )
+        return candidate
     if parsed.scheme != "https":
         logger.warning(
             "Refusing non-HTTPS xAI base_url override %r (xai-oauth bearer would "

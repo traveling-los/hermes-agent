@@ -5,8 +5,15 @@ Listens on ``http://<host>:<port>/v1/<path>`` and forwards each request to
 replaced by a freshly-resolved bearer from the configured adapter. The
 response is streamed back unmodified, preserving SSE.
 
-The server is intentionally minimal: it does NOT mediate, log, transform,
-or rewrite request/response bodies. It's a credential-attaching forwarder.
+The server is intentionally minimal: it does NOT mediate, transform, or
+rewrite request/response bodies. It's a credential-attaching forwarder.
+
+The one thing it *does* observe is spend: each forwarded chunk is teed into a
+:class:`~hermes_cli.proxy.spend_log.UsageSniffer` (after it has been written to
+the client, so the stream is never stalled) to recover the trailing ``usage``
+block, and one JSONL record per request is appended to the spend log. The
+caller is identified by the ``X-Hermes-Agent-Id`` request header, which is
+stripped before forwarding upstream. See ``hermes_cli/proxy/spend_log.py``.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import time
 from typing import Optional
 
 try:
@@ -26,6 +34,7 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
 
 from hermes_cli.proxy.adapters.base import UpstreamAdapter, UpstreamCredential
+from hermes_cli.proxy import spend_log
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +57,15 @@ _HOP_BY_HOP_HEADERS = frozenset(
     }
 )
 
+# Hermes-internal headers consumed by the proxy and NOT forwarded upstream.
+# ``X-Hermes-Agent-Id`` is how a caller names itself for spend attribution;
+# xAI has no use for it and it is not part of any provider API.
+_HERMES_INTERNAL_HEADERS = frozenset({spend_log.AGENT_ID_HEADER_LOWER})
+
+# Endpoints whose responses carry a ``usage`` block worth recording. Sniffing
+# /models or /embeddings would just be overhead.
+_SPEND_TRACKED_PATHS = frozenset({"/chat/completions", "/responses", "/completions"})
+
 DEFAULT_PORT = 8645
 DEFAULT_HOST = "127.0.0.1"
 # Body cap for forwarded requests. Chat-completion payloads with long agent
@@ -66,7 +84,8 @@ def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
     """Strip hop-by-hop + auth headers from the inbound request."""
     out = {}
     for key, value in headers.items():
-        if key.lower() in _HOP_BY_HOP_HEADERS:
+        lowered = key.lower()
+        if lowered in _HOP_BY_HOP_HEADERS or lowered in _HERMES_INTERNAL_HEADERS:
             continue
         out[key] = value
     return out
@@ -112,6 +131,49 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         rel_path = request.match_info.get("tail", "")
         rel_path = "/" + rel_path.lstrip("/")
 
+        started = time.monotonic()
+        agent_id = (
+            request.headers.get(spend_log.AGENT_ID_HEADER)
+            or spend_log.UNKNOWN_AGENT
+        )
+        track_spend = rel_path in _SPEND_TRACKED_PATHS
+
+        def _log_spend(
+            *,
+            status: int,
+            cred_used: Optional[UpstreamCredential],
+            model: Optional[str] = None,
+            stream: Optional[bool] = None,
+            usage=None,
+            response_bytes: Optional[int] = None,
+        ) -> None:
+            """Append one spend record. Best-effort — must never raise."""
+            if not track_spend:
+                return
+            try:
+                spend_log.write_record(
+                    spend_log.build_record(
+                        agent_id=agent_id,
+                        upstream_base_url=(
+                            cred_used.base_url if cred_used is not None else ""
+                        ),
+                        path=rel_path,
+                        model=model,
+                        stream=stream,
+                        status=status,
+                        credential_label=(
+                            getattr(cred_used, "label", None)
+                            if cred_used is not None
+                            else None
+                        ),
+                        usage=usage,
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        response_bytes=response_bytes,
+                    )
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("proxy: spend logging failed", exc_info=True)
+
         if rel_path not in adapter.allowed_paths:
             allowed = ", ".join(sorted(adapter.allowed_paths))
             return _json_error(
@@ -125,6 +187,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
             cred = adapter.get_credential()
         except Exception as exc:
             logger.warning("proxy: credential resolution failed: %s", exc)
+            _log_spend(status=401, cred_used=None)
             return _json_error(401, str(exc), code="upstream_auth_failed")
 
         # Forward body verbatim. Read into memory once — request bodies for
@@ -132,6 +195,9 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         # need to forward large multipart uploads we'll switch to streaming
         # the request body too.
         body = await request.read()
+
+        req_model = spend_log.request_model(body) if track_spend else None
+        req_stream = spend_log.request_is_stream(body) if track_spend else None
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -192,8 +258,15 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                     None,
                 )
 
+        active_cred = cred
         session_or_response, upstream_resp = await _open_upstream(cred)
         if upstream_resp is None:
+            _log_spend(
+                status=session_or_response.status,
+                cred_used=cred,
+                model=req_model,
+                stream=req_stream,
+            )
             return session_or_response
         session = session_or_response
 
@@ -208,10 +281,25 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 retry_cred = None
 
             if retry_cred is not None:
+                # The first credential's failure is spend-relevant on its own:
+                # it is how an account silently draining shows up in the log.
+                _log_spend(
+                    status=upstream_resp.status,
+                    cred_used=active_cred,
+                    model=req_model,
+                    stream=req_stream,
+                )
                 upstream_resp.release()
                 await session.close()
+                active_cred = retry_cred
                 session_or_response, upstream_resp = await _open_upstream(retry_cred)
                 if upstream_resp is None:
+                    _log_spend(
+                        status=session_or_response.status,
+                        cred_used=retry_cred,
+                        model=req_model,
+                        stream=req_stream,
+                    )
                     return session_or_response
                 session = session_or_response
 
@@ -222,17 +310,43 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
         )
         await resp.prepare(request)
 
+        # Tee for spend attribution. Chunks are handed to the sniffer *after*
+        # they have been written to the client, so observation can never add
+        # latency to (or stall) the forwarded stream.
+        sniffer = None
+        if track_spend:
+            content_type = (upstream_resp.headers.get("Content-Type") or "").lower()
+            sniffer = spend_log.UsageSniffer(
+                is_sse="text/event-stream" in content_type
+            )
+
         try:
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     await resp.write(chunk)
+                    if sniffer is not None:
+                        sniffer.feed(chunk)
         except (aiohttp.ClientError, asyncio.CancelledError) as exc:
             logger.warning("proxy: streaming interrupted: %s", exc)
         finally:
             upstream_resp.release()
             await session.close()
 
+        # Finish the client response first; only then do the (blocking, tiny)
+        # spend-log append, so the caller never waits on our bookkeeping.
         await resp.write_eof()
+
+        if sniffer is not None:
+            sniffer.finish()
+            _log_spend(
+                status=upstream_resp.status,
+                cred_used=active_cred,
+                model=sniffer.model or req_model,
+                stream=req_stream,
+                usage=sniffer.usage,
+                response_bytes=sniffer.bytes_seen,
+            )
+
         return resp
 
     # /health doesn't go through the upstream
