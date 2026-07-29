@@ -5,6 +5,23 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_proxy_spend_dir(tmp_path_factory, monkeypatch):
+    """Keep proxy spend records out of the developer's real spend log.
+
+    The proxy writes one JSONL record per forwarded request to
+    ``$HERMES_PROXY_SPEND_DIR`` (default ``~/.hermes/proxy-spend``). Any test
+    that drives ``create_app`` therefore lands synthetic rows in the operator's
+    live attribution data, where they are indistinguishable from fleet traffic
+    at a glance. Redirect every test in this package to a temp dir; tests that
+    assert on the log set the env var themselves and win via ordering.
+    """
+    monkeypatch.setenv(
+        "HERMES_PROXY_SPEND_DIR",
+        str(tmp_path_factory.mktemp("proxy-spend")),
+    )
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
