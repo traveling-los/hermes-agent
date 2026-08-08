@@ -1373,6 +1373,7 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "consecutive_failures": 0,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1593,6 +1594,8 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
+            "consecutive_failures": 0,
+            "circuit_breaker_tripped_at": None,
             "next_run_at": next_run_at,
         },
     )
@@ -1638,8 +1641,12 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+CRON_FAILURE_CIRCUIT_BREAKER_THRESHOLD = 3
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 status: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1648,6 +1655,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``status`` overrides the derived ``last_status`` ("ok"/"error") with a
+    specific terminal status for this run.
+
+    Recurring jobs are automatically paused after three consecutive failed
+    runs.  Only a successful run resets the streak; resuming a tripped job is
+    an explicit operator action.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1655,10 +1668,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
+                job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if success:
+                    job["consecutive_failures"] = 0
+                    job.pop("circuit_breaker_tripped_at", None)
+                else:
+                    job["consecutive_failures"] = int(
+                        job.get("consecutive_failures") or 0
+                    ) + 1
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1693,7 +1713,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return _normalize_job_record(job)
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1724,11 +1744,26 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     else:
                         job["enabled"] = False
                         job["state"] = "completed"
+                elif (
+                    not success
+                    and job.get("schedule", {}).get("kind") in {"cron", "interval"}
+                    and job["consecutive_failures"]
+                    >= CRON_FAILURE_CIRCUIT_BREAKER_THRESHOLD
+                ):
+                    job["enabled"] = False
+                    job["state"] = "paused"
+                    job["paused_at"] = now
+                    job["paused_reason"] = (
+                        "Circuit breaker: 3 consecutive failed runs; "
+                        "operator review required before resume."
+                    )
+                    job["circuit_breaker_tripped_at"] = now
+                    job["next_run_at"] = None
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return _normalize_job_record(job)
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
