@@ -31,7 +31,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, status=None):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -117,6 +117,70 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
 
     assert ok is False
     assert marks == [("j6", False)]
+
+
+def test_run_one_job_records_silent_as_distinct_terminal_status(monkeypatch):
+    _patch_pipeline(monkeypatch, silent_marker_in="[SILENT]")
+    marked = {}
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, status=None):
+        marked.update(job_id=jid, success=ok, status=status)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+
+    assert s.run_one_job({"id": "silent-1", "name": "quiet"}) is True
+    assert marked == {
+        "job_id": "silent-1",
+        "success": True,
+        "status": "silent",
+    }
+
+
+def test_run_one_job_records_delivery_failure_in_last_status(monkeypatch):
+    _patch_pipeline(monkeypatch)
+    marked = {}
+    monkeypatch.setattr(
+        s, "_deliver_result", lambda *a, **k: "platform send failed: 502",
+    )
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, status=None):
+        marked.update(
+            success=ok, delivery_error=delivery_error, status=status,
+        )
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+
+    job = {"id": "delivery-1", "name": "report", "deliver": "telegram:ops"}
+    assert s.run_one_job(job) is True
+    assert marked["success"] is True
+    assert marked["delivery_error"] == "platform send failed: 502"
+    assert marked["status"] == "delivery_failed"
+
+
+def test_run_one_job_pages_when_failure_trips_circuit_breaker(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=False, error="timeout")
+    delivered_content = []
+
+    def fake_deliver(job, content, adapters=None, loop=None):
+        calls.append(("deliver", job["id"]))
+        delivered_content.append(content)
+        return None
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, status=None):
+        calls.append(("mark", jid, ok))
+        return {
+            "id": jid,
+            "last_run_at": "2026-08-08T01:00:00+00:00",
+            "circuit_breaker_tripped_at": "2026-08-08T01:00:00+00:00",
+        }
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+
+    assert s.run_one_job({"id": "breaker-1", "name": "report"}) is True
+    deliveries = [call for call in calls if call[0] == "deliver"]
+    assert len(deliveries) == 2
+    assert "paused after 3 consecutive failed runs" in delivered_content[-1]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
