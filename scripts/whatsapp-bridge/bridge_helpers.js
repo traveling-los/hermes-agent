@@ -65,6 +65,71 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+// Delivery-failure acks (e.g. WhatsApp error 463 "account restricted /
+// missing tctoken" when starting a new chat) arrive asynchronously via
+// messages.update, AFTER a /send* call has already returned a message id.
+// Without this, /send* reported success as soon as WhatsApp *accepted* the
+// send, even when the recipient's device was later told the message was
+// rejected — see incident 2026-07-28 (cold-outreach sends silently failed
+// for days while the agent confidently reported them as delivered).
+export function createSendErrorTracker(limit = 256) {
+  const store = createBoundedMessageStore(limit);
+  // Chats we know already have a privacy token (tctoken) established —
+  // either they've messaged us before, or a prior send to them was
+  // verified clean. Once a chat is "known good" we skip the wait-and-check
+  // below entirely, so the latency cost of verifying delivery only ever
+  // hits the *first* message to a given contact, not every message in an
+  // ongoing conversation.
+  const knownGoodChats = new Set();
+
+  function record(key, update) {
+    const code = update?.messageStubParameters?.[0];
+    const note = code === '463'
+      ? 'WhatsApp blocked starting a new chat with this contact (error 463 — account restricted from reaching out to new numbers). The recipient likely needs to message this number first.'
+      : `WhatsApp rejected this message (error ${code || 'unknown'}).`;
+    store.remember({ key: { id: key?.id }, error: { code, note } });
+  }
+
+  function markChatKnownGood(chatId) {
+    if (chatId) knownGoodChats.add(chatId);
+  }
+
+  function isChatKnownGood(chatId) {
+    return knownGoodChats.has(chatId);
+  }
+
+  // Poll briefly for a delivery-failure ack on any of the given message ids.
+  // Resolves as soon as one is found; returns null if none arrived within
+  // the window (the common case — most sends succeed, so this shouldn't
+  // block replies on a full timeout every time).
+  async function waitFor(messageIds, { timeoutMs = 4000, pollMs = 250 } = {}) {
+    const ids = (messageIds || []).filter(Boolean);
+    if (!ids.length) return null;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      for (const id of ids) {
+        const hit = store.get(id);
+        if (hit) return { messageId: id, ...hit.error };
+      }
+      if (Date.now() >= deadline) return null;
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+    }
+  }
+
+  // Only actually pay the wait-and-check latency for chats we haven't
+  // already established are safe. Marks the chat known-good on a clean
+  // (error-free) result so every later message to the same contact is
+  // fast — the restriction is per-contact, not per-message.
+  async function checkDelivery(chatId, messageIds, opts) {
+    if (isChatKnownGood(chatId)) return null;
+    const error = await waitFor(messageIds, opts);
+    if (!error) markChatKnownGood(chatId);
+    return error;
+  }
+
+  return { record, waitFor, markChatKnownGood, isChatKnownGood, checkDelivery };
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

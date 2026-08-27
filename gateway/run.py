@@ -534,6 +534,9 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+_MODEL_ARTIFACT_TOKEN_RE = re.compile(r"<\|(?:eos|endoftext|im_end|im_start|eot_id)\|>")
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -552,6 +555,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     # Cancellation metadata, not assistant prose. ACP/TUI already suppress
     # this sentinel; chat surfaces should too (#7921).
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return ""
+
+    # Model stop-token artifacts leaking into prose (e.g. grok emitting a
+    # literal "<|eos|>" as or inside the final message). Strip them; if the
+    # message was ONLY the artifact, send nothing.
+    text = _MODEL_ARTIFACT_TOKEN_RE.sub("", str(text)).strip()
+    if not text:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -6367,6 +6377,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
+
+        # A2A: never ack a bot sender. A fleet agent's reply arriving mid-run
+        # would get "Interrupting current task…" posted into its thread (and
+        # @mentioned back at it via the Slack A2A auto-mention), which the
+        # agent then processes as a new instruction. Bots don't need
+        # reassurance; their input is still processed/queued normally.
+        if getattr(event.source, "is_bot", False):
+            logger.debug("Busy ack suppressed for bot sender in session %s", session_key)
+            return True
 
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
@@ -14572,7 +14591,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            history_media_paths=_history_media_paths,
+                            history_media_paths=_collect_history_media_paths(
+                                agent_messages
+                            ),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).

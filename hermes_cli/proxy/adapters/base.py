@@ -34,6 +34,11 @@ class UpstreamCredential:
     expires_at: Optional[str] = None
     """ISO-8601 expiry timestamp for the bearer, when known. Informational."""
 
+    label: Optional[str] = None
+    """Human-readable account name this bearer came from (e.g. a credential-pool
+    label). Used only for spend attribution logging — never a secret, and never
+    sent upstream."""
+
 
 class UpstreamAdapter(ABC):
     """Contract for an upstream provider the proxy can forward to."""

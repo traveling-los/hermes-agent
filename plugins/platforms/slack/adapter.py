@@ -1025,6 +1025,17 @@ class SlackAdapter(BasePlatformAdapter):
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set[str] = set()
         self._BOT_TS_MAX = 5000  # cap to avoid unbounded growth
+        # A2A: threads started by an admitted bot (allow_bots) → that bot's
+        # user id. Replies into these threads get the bot @mentioned so its
+        # mentions-mode gateway actually receives them (prompt-based mention
+        # compliance proved unreliable across fleet agents).
+        self._a2a_bot_requesters: dict[str, str] = {}
+        # A2A hard brake: admitted-bot messages processed per thread. Two LLM
+        # agents plus auto-mentions can courtesy-ping-pong indefinitely
+        # (observed 30+ msgs Vinny↔Ady 2026-07-28); past the budget, bot
+        # messages in that thread are dropped silently. Humans are unaffected.
+        self._a2a_thread_bot_msgs: dict[str, int] = {}
+        self._A2A_THREAD_BOT_BUDGET = 6
         # Track threads where the bot has been @mentioned — once mentioned,
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set[str] = set()
@@ -2767,10 +2778,23 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
+            thread_ts = self._resolve_thread_ts(reply_to, metadata)
+
+            # A2A: replying in a thread opened by an admitted bot (allow_bots)
+            # → prepend its @mention so its mentions-mode gateway receives the
+            # reply. Deterministic — prompt-based mention compliance proved
+            # unreliable. No-op for human-opened threads.
+            if thread_ts:
+                _a2a_team = self._metadata_team_id(metadata)
+                _requester = self._a2a_bot_requesters.get(
+                    self._workspace_event_id(_a2a_team, thread_ts)
+                )
+                if _requester and f"<@{_requester}>" not in formatted:
+                    formatted = f"<@{_requester}> {formatted}"
+
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -5573,17 +5597,55 @@ class SlackAdapter(BasePlatformAdapter):
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                # Multi-workspace: ``self._bot_user_id`` is the PRIMARY
+                # workspace's bot user id, so the mention check must resolve
+                # the id for the workspace this event came from or secondary
+                # workspaces never match (e.g. bot-to-bot mentions in a
+                # non-primary workspace were always dropped).
+                team_bot_user_id = (
+                    self._team_bot_user_ids.get(dedup_team_id)
+                    or self._bot_user_id
+                )
+                if team_bot_user_id and f"<@{team_bot_user_id}>" not in text_check:
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
                         "no <@%s> mention in flat text or blocks",
-                        self._bot_user_id,
+                        team_bot_user_id,
                     )
                     return
             # "all" falls through to process the message
-            # Always ignore our own messages to prevent echo loops
-            if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
+            # Always ignore our own messages to prevent echo loops — match any
+            # of OUR per-workspace bot user ids, not just the primary one.
+            own_bot_ids = set(self._team_bot_user_ids.values())
+            if self._bot_user_id:
+                own_bot_ids.add(self._bot_user_id)
+            if msg_user and msg_user in own_bot_ids:
                 return
+            # A2A: remember the admitted bot behind this conversation so our
+            # reply can @mention it (see send()).
+            if msg_user:
+                a2a_key = self._workspace_event_id(
+                    dedup_team_id, event.get("thread_ts") or event.get("ts", "")
+                )
+                self._a2a_bot_requesters[a2a_key] = msg_user
+                if len(self._a2a_bot_requesters) > 500:
+                    for _k in list(self._a2a_bot_requesters)[:250]:
+                        self._a2a_bot_requesters.pop(_k, None)
+                # Hard brake: past the per-thread budget, drop bot messages.
+                _n = self._a2a_thread_bot_msgs.get(a2a_key, 0) + 1
+                self._a2a_thread_bot_msgs[a2a_key] = _n
+                if len(self._a2a_thread_bot_msgs) > 500:
+                    for _k in list(self._a2a_thread_bot_msgs)[:250]:
+                        self._a2a_thread_bot_msgs.pop(_k, None)
+                if _n > self._A2A_THREAD_BOT_BUDGET:
+                    logger.info(
+                        "[Slack] A2A thread budget exhausted (%d>%d) — "
+                        "dropping bot message in %s",
+                        _n,
+                        self._A2A_THREAD_BOT_BUDGET,
+                        event.get("channel", ""),
+                    )
+                    return
 
         # Ignore message deletions. Edits are normalized above so an @mention
         # added by edit can still wake the bot once.
@@ -8303,7 +8365,14 @@ class SlackAdapter(BasePlatformAdapter):
            carried no team info (thread replies / mentions in multi-workspace
            installs). This prevents defaulting to the primary workspace token,
            which makes Slack return an HTML login page instead of file bytes.
-        3. Primary workspace token as a last resort.
+        3. The primary connection's own client token — mirrors ``_get_client()``'s
+           fallback (``:2585``). ``self.config.token`` is the *raw*, unsplit
+           config value; for a multi-workspace install that's a comma-joined
+           ``"xoxb-A,xoxb-B"`` string that Slack never accepts, so it must not
+           be used as a bearer token on its own.
+        4. ``self.config.token`` as an absolute last resort (single-workspace
+           installs only reach this — ``_app``/``_app.client`` unset means we
+           are not connected at all).
         """
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id].token
@@ -8313,6 +8382,12 @@ class SlackAdapter(BasePlatformAdapter):
                 url_team = m.group(1)
                 if url_team in self._team_clients:
                     return self._team_clients[url_team].token
+        except Exception:  # pragma: no cover - defensive
+            pass
+        try:
+            primary_token = getattr(self._app.client, "token", None) if self._app else None
+            if primary_token:
+                return primary_token
         except Exception:  # pragma: no cover - defensive
             pass
         return self.config.token or ""
