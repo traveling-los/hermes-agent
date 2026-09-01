@@ -79,7 +79,7 @@ class XAIGrokAdapter(UpstreamAdapter):
         failed_credential: UpstreamCredential,
         status_code: int,
     ) -> Optional[UpstreamCredential]:
-        if status_code not in {401, 429}:
+        if status_code not in {401, 403, 429}:
             return None
 
         with self._lock:
@@ -87,7 +87,7 @@ class XAIGrokAdapter(UpstreamAdapter):
             if pool is None:
                 return None
 
-            if status_code == 429:
+            if status_code in (429, 403):
                 # Mark the rate-limited key with its 1-hour cooldown and rotate
                 # to the next available credential. Returns None when the pool
                 # has no other key to offer — the 429 will flow back to the client.
@@ -135,10 +135,13 @@ class XAIGrokAdapter(UpstreamAdapter):
         )
         base_url = str(base_url or DEFAULT_XAI_OAUTH_BASE_URL).strip().rstrip("/")
 
+        label = getattr(entry, "label", None) or getattr(entry, "id", None)
+
         return UpstreamCredential(
             bearer=bearer,
             base_url=base_url or DEFAULT_XAI_OAUTH_BASE_URL,
             expires_at=getattr(entry, "expires_at", None),
+            label=str(label) if label else None,
         )
 
 
