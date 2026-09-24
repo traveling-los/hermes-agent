@@ -706,3 +706,146 @@ class TestBomToleranceInMemoryFiles:
         raw, read_ok = MemoryStore._read_raw_checked(path)
         assert read_ok is False
         assert raw == ""
+
+
+# =========================================================================
+# replace shrink guard (ley #358)
+# A replace whose new content is under half of a >500 char entry is a wipe
+# of that entry. Measured on Eva 2026-09-24: one entry 3974 -> 259, and a
+# one-line replace inside a multi-line block (file 4642 -> 2404). These
+# tests measure the ENTRY, not the file.
+# =========================================================================
+
+_SHRINK_HINT = (
+    "replace cambia la entrada entera ({n} chars); "
+    "para cambiar un renglón manda la entrada completa editada, "
+    "o parte la entrada en hechos"
+)
+
+
+@pytest.fixture()
+def wide_store(tmp_path, monkeypatch):
+    """Store whose char limit can hold the Eva-sized entries under test."""
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    s = MemoryStore(memory_char_limit=8000, user_char_limit=8000)
+    s.load_from_disk()
+    return s
+
+
+def _entry_with_needle(total: int, needle: str) -> str:
+    prefix = "memo "
+    pad = total - len(prefix) - len(needle)
+    assert pad > 0, (total, len(prefix), len(needle))
+    return prefix + ("a" * pad) + needle
+
+
+class TestReplaceShrinkGuard:
+    def test_one_line_inside_long_block_is_refused(self, wide_store):
+        """Known-bad: a 1-line replace inside a long block wipes that entry.
+
+        Eva 2026-09-24: the file went 4642 -> 2404. The unit under test is
+        the matched entry, which replace rewrites whole.
+        """
+        line = "Christine juega padel el martes en Old Town"
+        escuela = "\n".join(
+            ["## escuela", line]
+            + [f"dato escuela {i}: clase de matematicas a las 8" for i in range(40)]
+        )
+        assert len(escuela) > 500
+        others = [f"[lane] hecho corto {i}" for i in range(3)]
+        for entry in others + [escuela]:
+            added = wide_store.add("memory", entry)
+            assert added["success"] is True, added
+
+        short = "Christine juega padel el martes"
+        assert len(short) * 2 < len(escuela)
+        before = list(wide_store.memory_entries)
+        result = wide_store.replace("memory", "Old Town", short)
+
+        matched = [e for e in wide_store.memory_entries if "escuela" in e or e == short]
+        assert matched, wide_store.memory_entries
+        assert result["success"] is False, (
+            f"replace encogió la entrada {len(escuela)} -> {len(matched[0])}"
+        )
+        assert result["error"] == _SHRINK_HINT.format(n=len(escuela))
+        assert wide_store.memory_entries == before
+        assert len(matched[0]) == len(escuela)
+
+    def test_single_entry_file_shrink_3974_to_259_is_refused(self, wide_store):
+        """Known-bad: one entry is the whole file. Eva 2026-09-21, 3974 -> 259."""
+        entry = _entry_with_needle(3974, "Old Town")
+        assert len(entry) == 3974
+        added = wide_store.add("memory", entry)
+        assert added["success"] is True, added
+        assert len(wide_store.memory_entries) == 1
+
+        new_content = "b" * 259
+        assert len(new_content) == 259
+        result = wide_store.replace("memory", "Old Town", new_content)
+
+        assert result["success"] is False, (
+            f"replace encogió la entrada 3974 -> {len(wide_store.memory_entries[0])}"
+        )
+        assert result["error"] == _SHRINK_HINT.format(n=3974)
+        assert wide_store.memory_entries == [entry]
+        assert len(wide_store.memory_entries[0]) == 3974
+
+    def test_short_entry_shrink_is_allowed(self, wide_store):
+        """A replace on an entry under 500 chars still passes."""
+        small = "prefijo " + ("c" * 480)
+        assert len(small) < 500
+        added = wide_store.add("memory", small)
+        assert added["success"] is True, added
+        new = "corto"
+        assert len(new) * 2 < len(small)
+        result = wide_store.replace("memory", "prefijo", new)
+        assert result["success"] is True
+        assert wide_store.memory_entries == [new]
+
+    def test_full_long_entry_with_one_line_edited_is_allowed(self, wide_store):
+        """Sending the whole long entry back, with one line edited, passes."""
+        line = "renglon editable unico"
+        rest = "\n".join(f"linea {i} " + ("b" * 40) for i in range(20))
+        block = line + "\n" + rest
+        edited = "renglon ya editado\n" + rest
+        assert len(block) > 500
+        assert len(edited) * 2 >= len(block)
+        added = wide_store.add("memory", block)
+        assert added["success"] is True, added
+        result = wide_store.replace("memory", line, edited)
+        assert result["success"] is True, result
+        assert wide_store.memory_entries == [edited]
+
+    def test_replace_one_of_29_leaves_the_other_28(self, wide_store):
+        entries = [f"hecho {i:02d} estable" for i in range(29)]
+        for entry in entries:
+            added = wide_store.add("memory", entry)
+            assert added["success"] is True, added
+        new = "hecho 07 cambiado"
+        result = wide_store.replace("memory", entries[7], new)
+        assert result["success"] is True, result
+        expected = list(entries)
+        expected[7] = new
+        assert wide_store.memory_entries == expected
+        assert wide_store.memory_entries[:7] == entries[:7]
+        assert wide_store.memory_entries[8:] == entries[8:]
+
+    def test_batch_replace_of_long_entry_is_refused(self, wide_store):
+        """The operations array is the same replace. It must not walk around the guard."""
+        entry = _entry_with_needle(800, "Old Town")
+        added = wide_store.add("memory", entry)
+        assert added["success"] is True, added
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[{
+                "action": "replace",
+                "old_text": "Old Town",
+                "content": "b" * 10,
+            }],
+            store=wide_store,
+        ))
+        assert result["success"] is False, (
+            f"batch encogió la entrada 800 -> {len(wide_store.memory_entries[0])}"
+        )
+        assert "replace cambia la entrada entera (800 chars)" in result["error"]
+        assert wide_store.memory_entries == [entry]

@@ -77,6 +77,30 @@ MEMORY_BLOCK_HEADERS = {
 
 ENTRY_DELIMITER = "\n§\n"
 
+# replace rewrites the whole matched entry. Above this size, new content
+# shorter than half the entry is refused. Exactly half is allowed.
+# Entries at or under this size may still shrink. Ley #358, 2026-09-24.
+_REPLACE_SHRINK_MIN_ENTRY_CHARS = 500
+
+
+def _replace_shrink_error(entry: str, new_content: str) -> Optional[str]:
+    """Return the refusal text when a replace would cut a long entry below half.
+
+    ``new_content`` is under half when ``2 * len(new_content) < len(entry)``.
+    Returns None when the replace may proceed.
+    """
+    entry_chars = len(entry)
+    if (
+        entry_chars > _REPLACE_SHRINK_MIN_ENTRY_CHARS
+        and len(new_content) * 2 < entry_chars
+    ):
+        return (
+            f"replace cambia la entrada entera ({entry_chars} chars); "
+            "para cambiar un renglón manda la entrada completa editada, "
+            "o parte la entrada en hechos"
+        )
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -514,6 +538,10 @@ class MemoryStore:
                 # All identical -- safe to replace just the first
 
             idx = matches[0][0]
+            shrink_error = _replace_shrink_error(entries[idx], new_content)
+            if shrink_error:
+                return {"success": False, "error": shrink_error}
+
             limit = self._char_limit(target)
 
             # Check that replacement doesn't blow the budget
@@ -650,6 +678,9 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    shrink_error = _replace_shrink_error(working[matches[0]], content)
+                    if shrink_error:
+                        return self._batch_error(target, shrink_error)
                     working[matches[0]] = content
 
                 elif act == "remove":
