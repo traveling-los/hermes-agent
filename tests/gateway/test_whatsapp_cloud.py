@@ -742,6 +742,69 @@ class TestWebhookDispatch:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_dispatch_drops_ignored_phone_number_id(self, monkeypatch):
+        monkeypatch.setenv(
+            "WHATSAPP_CLOUD_IGNORE_PHONE_NUMBER_IDS",
+            "1329488180254120",
+        )
+        adapter = _make_adapter(
+            app_secret="key",
+            phone_number_id="1374175165770116",
+        )
+        adapter.handle_message = AsyncMock()
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [
+                {
+                    "id": "x",
+                    "changes": [
+                        {
+                            "field": "messages",
+                            "value": {
+                                "metadata": {
+                                    "phone_number_id": "1329488180254120"
+                                },
+                                "messages": [
+                                    {
+                                        "from": "16193409664",
+                                        "id": "wamid.ignore645",
+                                        "timestamp": "0",
+                                        "type": "text",
+                                        "text": {"body": "no-debe-entrar"},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        body = json.dumps(payload).encode("utf-8")
+        sig = _sign("key", body)
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+        adapter.handle_message.assert_not_called()
+        assert adapter._accepted_count == 0
+
+    @pytest.mark.asyncio
+    async def test_dispatch_keeps_other_numbers_when_ignore_set(self, monkeypatch):
+        monkeypatch.setenv(
+            "WHATSAPP_CLOUD_IGNORE_PHONE_NUMBER_IDS",
+            "1329488180254120",
+        )
+        adapter = _make_adapter(app_secret="key")
+        adapter.handle_message = AsyncMock()
+        body = json.dumps(_SAMPLE_INBOUND_TEXT_PAYLOAD).encode("utf-8")
+        sig = _sign("key", body)
+        response = await adapter._handle_webhook(
+            _post_request(body, {"X-Hub-Signature-256": sig})
+        )
+        assert response.status == 200
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_dispatch_handles_button_reply(self):
         adapter = _make_adapter(app_secret="key")
         captured = []
