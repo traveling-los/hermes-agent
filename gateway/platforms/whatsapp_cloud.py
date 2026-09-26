@@ -1570,6 +1570,25 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 value = change.get("value") or {}
                 contacts = value.get("contacts") or []
                 metadata = value.get("metadata") or {}
+                # Same WABA, several numbers, one webhook. A number listed in
+                # WHATSAPP_CLOUD_IGNORE_PHONE_NUMBER_IDS is acked (the caller
+                # already returns 200) and not turned into an agent turn.
+                inbound_pnid = str(metadata.get("phone_number_id") or "").strip()
+                ignored_pnids = {
+                    part.strip()
+                    for part in os.environ.get(
+                        "WHATSAPP_CLOUD_IGNORE_PHONE_NUMBER_IDS", ""
+                    ).split(",")
+                    if part.strip()
+                }
+                if inbound_pnid and inbound_pnid in ignored_pnids:
+                    logger.info(
+                        "[whatsapp_cloud] drop inbound for ignored "
+                        "phone_number_id %s (%d message(s))",
+                        inbound_pnid,
+                        len(value.get("messages") or []),
+                    )
+                    continue
                 # Build a wa_id → profile-name index for the messages we're
                 # about to surface.
                 contacts_by_waid: Dict[str, str] = {}
