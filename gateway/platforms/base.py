@@ -2606,6 +2606,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_code: Optional[str] = None
         self._fatal_error_message: Optional[str] = None
         self._fatal_error_retryable = True
+        self._fatal_error_requires_process_restart = False
         self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
         # Cross-HERMES_HOME token takeover is armed by GatewayRunner only for
         # an adapter's initial connect during an explicit ``gateway run
@@ -2933,6 +2934,11 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
+    @property
+    def fatal_error_requires_process_restart(self) -> bool:
+        """Whether recovery requires the service manager to restart the process."""
+        return self._fatal_error_requires_process_restart
+
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Whether auto-TTS on voice input should fire for ``chat_id``.
 
@@ -2956,6 +2962,7 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_code = None
         self._fatal_error_message = None
         self._fatal_error_retryable = True
+        self._fatal_error_requires_process_restart = False
         self._write_runtime_status_safe("connected", platform_state="connected", error_code=None, error_message=None)
 
     def _mark_disconnected(self) -> None:
@@ -2964,11 +2971,19 @@ class BasePlatformAdapter(ABC):
             return
         self._write_runtime_status_safe("disconnected", platform_state="disconnected", error_code=None, error_message=None)
 
-    def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
+    def _set_fatal_error(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        requires_process_restart: bool = False,
+    ) -> None:
         self._running = False
         self._fatal_error_code = code
         self._fatal_error_message = message
         self._fatal_error_retryable = retryable
+        self._fatal_error_requires_process_restart = requires_process_restart
         self._write_runtime_status_safe("fatal", platform_state="fatal", error_code=code, error_message=message)
 
     def _write_runtime_status_safe(self, context: str, **kwargs) -> None:

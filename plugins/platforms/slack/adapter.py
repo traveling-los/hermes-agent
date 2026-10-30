@@ -668,42 +668,72 @@ _SOCKET_CLIENT_TASK_ATTRS = (
 # Cap on how long teardown waits for cancelled tasks. A task wedged in a network
 # call must not be able to hold up shutdown indefinitely.
 _SOCKET_TASK_CANCEL_TIMEOUT_S = 3.0
+_SOCKET_RECONNECT_TIMEOUT_S = 300.0
+_SOCKET_RECONNECT_BACKOFF_BASE_S = 15.0
+_SOCKET_RECONNECT_BACKOFF_MAX_S = 60.0
 
 
-async def _cancel_socket_tasks(tasks: Any) -> None:
-    """Cancel Socket Mode tasks and wait, with a bound, for them to finish.
+async def _cancel_socket_tasks(task_provider: Any) -> None:
+    """Cancel Socket Mode tasks and drain changing task sets before teardown.
 
     Cancellation is only a request until the task is awaited, so a caller that
-    cancels without awaiting can still race the work it meant to stop.
+    cancels without awaiting can still race the work it meant to stop. The SDK
+    can replace its task attributes while ``connect()`` settles, so ask for a
+    fresh task snapshot after every await. Never let the caller close the shared
+    session if a task survives the bounded drain.
     """
-    pending = set()
-    for task in tasks:
-        if task is None or not callable(getattr(task, "cancel", None)):
-            continue
-        if callable(getattr(task, "done", None)) and task.done():
-            continue
-        task.cancel()
-        pending.add(task)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SOCKET_TASK_CANCEL_TIMEOUT_S
 
-    if not pending:
-        return
+    def _active_tasks() -> set:
+        return {
+            task
+            for task in task_provider()
+            if task is not None
+            and callable(getattr(task, "cancel", None))
+            and not (callable(getattr(task, "done", None)) and task.done())
+        }
 
-    done, still_running = await asyncio.wait(
-        pending, timeout=_SOCKET_TASK_CANCEL_TIMEOUT_S
+    while True:
+        pending = _active_tasks()
+        if not pending:
+            # Let done callbacks and SDK task rebinds run before declaring the
+            # client's task set stable.
+            await asyncio.sleep(0)
+            if not _active_tasks():
+                return
+            if loop.time() >= deadline:
+                break
+            continue
+
+        for task in pending:
+            task.cancel()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        done, still_running = await asyncio.wait(pending, timeout=remaining)
+        for task in done:
+            if task.cancelled():
+                continue
+            try:
+                exc = task.exception()
+            except (asyncio.CancelledError, Exception):  # pragma: no cover
+                exc = None
+            if exc is not None:  # pragma: no cover - defensive logging
+                logger.debug(
+                    "[Slack] Socket Mode task failed while stopping: %s", exc
+                )
+        if still_running and loop.time() >= deadline:
+            break
+
+    remaining_count = len(_active_tasks())
+    logger.error(
+        "[Slack] %d Socket Mode task(s) did not stop within %.1fs; "
+        "leaving their session open for another cleanup attempt",
+        remaining_count,
+        _SOCKET_TASK_CANCEL_TIMEOUT_S,
     )
-    for task in done:
-        if task.cancelled():
-            continue
-        if task.exception() is not None:  # pragma: no cover - defensive logging
-            logger.debug(
-                "[Slack] Socket Mode task failed while stopping", exc_info=True
-            )
-    if still_running:  # pragma: no cover - defensive logging
-        logger.warning(
-            "[Slack] %d Socket Mode task(s) did not stop within %.1fs",
-            len(still_running),
-            _SOCKET_TASK_CANCEL_TIMEOUT_S,
-        )
+    raise TimeoutError("Slack Socket Mode tasks did not stop before session teardown")
 
 
 _SLACK_PROXY_HOSTS = (
@@ -892,6 +922,9 @@ class _WorkspaceConnection:
     # connect. Per-connection so one workspace's reconnect can't reset another
     # workspace's grace window.
     handler_started_monotonic: Optional[float] = None
+    reconnect_started_monotonic: Optional[float] = None
+    next_reconnect_monotonic: Optional[float] = None
+    reconnect_attempts: int = 0
     reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     team_id: str = ""  # filled after auth_test
     team_name: str = ""
@@ -1283,14 +1316,14 @@ class SlackAdapter(BasePlatformAdapter):
         """
         handler = conn.handler
         task = conn.socket_task
-        conn.handler = None
-        conn.socket_task = None
-        conn.handler_started_monotonic = None
-
         client = getattr(handler, "client", None)
-        await _cancel_socket_tasks(
-            [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS]
-        )
+
+        def _tasks() -> list:
+            return [task] + [
+                getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS
+            ]
+
+        await _cancel_socket_tasks(_tasks)
 
         if handler is not None:
             try:
@@ -1301,6 +1334,47 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
+                # Some SDK versions call disconnect() before cancelling their
+                # tasks. If disconnect raises, the adapter has already drained
+                # those tasks, so close the underlying session directly.
+                session = getattr(client, "aiohttp_client_session", None)
+                close_session = getattr(session, "close", None)
+                if callable(close_session):
+                    try:
+                        result = close_session()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:
+                        logger.warning(
+                            "[Slack] Error while closing Socket Mode session",
+                            exc_info=True,
+                        )
+
+        if conn.handler is handler:
+            conn.handler = None
+        if conn.socket_task is task:
+            conn.socket_task = None
+        conn.handler_started_monotonic = None
+
+    def _socket_session_closed(self, conn: _WorkspaceConnection) -> bool:
+        """Detect a dead aiohttp session even if the SDK reports connected."""
+        client = getattr(conn.handler, "client", None)
+        session = getattr(client, "aiohttp_client_session", None)
+        return getattr(session, "closed", False) is True
+
+    async def _fail_socket_reconnect(self, conn: _WorkspaceConnection) -> None:
+        message = (
+            "Slack Socket Mode for workspace "
+            f"{_conn_log_label(conn)} did not reconnect within five minutes"
+        )
+        logger.error("[Slack] %s; requesting gateway restart", message)
+        self._set_fatal_error(
+            "slack_reconnect_timeout",
+            message,
+            retryable=True,
+            requires_process_restart=True,
+        )
+        await self._notify_fatal_error()
 
     async def _socket_transport_connected(
         self, conn: _WorkspaceConnection
@@ -1367,22 +1441,41 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not conn.app or not conn.app_token:
                 return
 
+            now = time.monotonic()
+            if conn.reconnect_started_monotonic is None:
+                conn.reconnect_started_monotonic = now
+            if now - conn.reconnect_started_monotonic >= _SOCKET_RECONNECT_TIMEOUT_S:
+                await self._fail_socket_reconnect(conn)
+                return
+            if (
+                conn.next_reconnect_monotonic is not None
+                and now < conn.next_reconnect_monotonic
+            ):
+                return
+
             logger.warning(
                 "[Slack] Socket Mode unhealthy (%s) for workspace %s; reconnecting",
                 reason,
                 _conn_log_label(conn),
             )
-            await self._stop_socket_mode_handler(conn)
-
             try:
+                await self._stop_socket_mode_handler(conn)
                 self._start_socket_mode_handler(conn)
-            except Exception as exc:  # pragma: no cover - defensive logging
+            except Exception as exc:
                 logger.error(
                     "[Slack] Socket Mode reconnect failed for workspace %s: %s",
                     _conn_log_label(conn),
                     exc,
                     exc_info=True,
                 )
+            finally:
+                conn.reconnect_attempts += 1
+                delay = min(
+                    _SOCKET_RECONNECT_BACKOFF_BASE_S
+                    * (2 ** (conn.reconnect_attempts - 1)),
+                    _SOCKET_RECONNECT_BACKOFF_MAX_S,
+                )
+                conn.next_reconnect_monotonic = time.monotonic() + delay
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -1408,10 +1501,29 @@ class SlackAdapter(BasePlatformAdapter):
                         await self._restart_socket_mode(conn, "socket task stopped")
                         continue
 
+                    session_closed = self._socket_session_closed(conn)
                     connected = await self._socket_transport_connected(conn)
-                    if connected is False:
+                    ping_stale = self._socket_ping_pong_stale(conn)
+                    if connected is True and not session_closed and not ping_stale:
+                        conn.reconnect_started_monotonic = None
+                        conn.next_reconnect_monotonic = None
+                        conn.reconnect_attempts = 0
+                        continue
+
+                    if conn.reconnect_started_monotonic is None:
+                        conn.reconnect_started_monotonic = time.monotonic()
+                    if (
+                        time.monotonic() - conn.reconnect_started_monotonic
+                        >= _SOCKET_RECONNECT_TIMEOUT_S
+                    ):
+                        await self._fail_socket_reconnect(conn)
+                        continue
+
+                    if session_closed:
+                        await self._restart_socket_mode(conn, "session closed")
+                    elif connected is False:
                         await self._restart_socket_mode(conn, "transport disconnected")
-                    elif self._socket_ping_pong_stale(conn):
+                    elif ping_stale:
                         # is_connected() can lie when the aiohttp session is
                         # closed but the client keeps retrying; ping/pong
                         # staleness catches that wedged-zombie case that the
