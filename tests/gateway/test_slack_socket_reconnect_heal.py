@@ -14,6 +14,8 @@ from outliving a teardown.
 
 import asyncio
 import sys
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +64,8 @@ _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter, _WorkspaceConnection  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
+from gateway.platforms.base import Platform  # noqa: E402
+from gateway.run import GatewayRunner  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +328,76 @@ class TestSocketModeTeardown:
 
 class TestSocketModeRestart:
     @pytest.mark.asyncio
+    async def test_closed_session_replaces_old_client(self, adapter):
+        """A closed aiohttp session must not leave Slack retrying forever.
+
+        The SDK's ``is_connected()`` can still report true while a reconnect
+        task loops against a manually closed ClientSession. The adapter must
+        recognize the closed session directly, retire every old task, then
+        create a handler with a fresh session.
+        """
+        old = _FakeHandler()
+        old.client.aiohttp_client_session.reachable = True
+        old.client.ping_interval = 5
+        old.client.last_ping_pong_time = time.time()
+        old.client.is_connected = AsyncMock(return_value=True)
+        _attach(adapter, old)
+        await asyncio.sleep(0.01)
+
+        retry_task = asyncio.create_task(old.client.connect())
+        old.client.message_receiver = retry_task
+        await old.client.aiohttp_client_session.close()
+        await asyncio.sleep(0.01)
+        retries_before_watchdog = (
+            old.client.aiohttp_client_session.ws_connect_after_close
+        )
+
+        started: list[_FakeHandler] = []
+        retries_at_replacement: list[int] = []
+
+        def _start_fresh(conn) -> None:
+            assert retry_task.done(), "old retry task survived into handler replacement"
+            retries_at_replacement.append(
+                old.client.aiohttp_client_session.ws_connect_after_close
+            )
+            fresh = _FakeHandler()
+            fresh.client.aiohttp_client_session.reachable = True
+            conn.handler = fresh
+            conn.socket_task = asyncio.create_task(fresh.start_async())
+            started.append(fresh)
+
+        with patch.object(adapter, "_start_socket_mode_handler", _start_fresh):
+
+            async def _stop_after_probe() -> None:
+                await asyncio.sleep(0.04)
+                adapter._running = False
+
+            stop_task = asyncio.create_task(_stop_after_probe())
+            adapter._socket_watchdog_interval_s = 0.005
+            await adapter._socket_watchdog_loop()
+            await stop_task
+
+        await asyncio.sleep(0.02)
+        assert len(started) == 1, (
+            "closed-session client was not replaced; old SDK retry count="
+            f"{old.client.aiohttp_client_session.ws_connect_after_close}"
+        )
+        assert (
+            started[0].client.aiohttp_client_session
+            is not old.client.aiohttp_client_session
+        ), "replacement handler reused the closed aiohttp session"
+        assert retry_task.done(), "old client retry task outlived its session"
+        assert retries_before_watchdog > 0, "test did not enter the SDK's bad loop"
+        assert (
+            old.client.aiohttp_client_session.ws_connect_after_close
+            == retries_at_replacement[0]
+        ), (
+            "old client continued retrying after handler replacement "
+            f"({retries_at_replacement[0]} -> "
+            f"{old.client.aiohttp_client_session.ws_connect_after_close})"
+        )
+
+    @pytest.mark.asyncio
     async def test_restart_stops_old_handler_before_starting_new_one(self, adapter):
         """A reconnect must fully retire the old handler before replacing it."""
         old = _FakeHandler()
@@ -346,6 +420,92 @@ class TestSocketModeRestart:
 
         assert started == ["started"]
         assert old.client.aiohttp_client_session.ws_connect_after_close == 0
+
+    @pytest.mark.asyncio
+    async def test_reconnect_retries_use_exponential_backoff(self, adapter):
+        conn = _conn(adapter)
+        starts: list[str] = []
+
+        async def _stop(_conn) -> None:
+            _conn.handler = None
+            _conn.socket_task = None
+
+        def _start(_conn) -> None:
+            starts.append("start")
+            _conn.handler = MagicMock()
+
+        with (
+            patch.object(adapter, "_stop_socket_mode_handler", _stop),
+            patch.object(adapter, "_start_socket_mode_handler", _start),
+        ):
+            await adapter._restart_socket_mode(conn, "session closed")
+            first_deadline = conn.next_reconnect_monotonic
+            await adapter._restart_socket_mode(conn, "session closed")
+            assert len(starts) == 1, "retry ignored its backoff window"
+
+            conn.next_reconnect_monotonic = time.monotonic() - 1
+            await adapter._restart_socket_mode(conn, "session closed")
+
+        assert len(starts) == 2
+        assert conn.reconnect_attempts == 2
+        assert first_deadline is not None
+        assert conn.next_reconnect_monotonic - time.monotonic() > 29
+
+    @pytest.mark.asyncio
+    async def test_five_minute_outage_requests_process_restart(self, adapter):
+        conn = _conn(adapter)
+        handler = _FakeHandler()
+        handler.client.aiohttp_client_session.closed = True
+        conn.handler = handler
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        conn.socket_task = live_task
+        conn.reconnect_started_monotonic = time.monotonic() - 301
+        adapter._notify_fatal_error = AsyncMock()
+        adapter._socket_watchdog_interval_s = 0.001
+
+        await adapter._socket_watchdog_loop()
+
+        assert adapter.fatal_error_code == "slack_reconnect_timeout"
+        assert adapter.fatal_error_requires_process_restart is True
+        adapter._notify_fatal_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_gateway_exits_with_failure_for_process_restart_request(self):
+        runner = object.__new__(GatewayRunner)
+        runner._exit_reason = None
+        runner._exit_with_failure = False
+        runner.stop = AsyncMock()
+        adapter = SimpleNamespace(
+            fatal_error_requires_process_restart=True,
+            fatal_error_message="Slack Socket Mode did not reconnect",
+            platform=SimpleNamespace(value="slack"),
+        )
+
+        await runner._handle_adapter_fatal_error_impl(adapter)
+
+        assert runner.should_exit_with_failure is True
+        assert runner.exit_reason == "Slack Socket Mode did not reconnect"
+        runner.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_profile_gateway_exits_for_process_restart_request(self):
+        runner = object.__new__(GatewayRunner)
+        runner._exit_reason = None
+        runner._exit_with_failure = False
+        runner.stop = AsyncMock()
+        platform = Platform.SLACK
+        adapter = SimpleNamespace(
+            fatal_error_requires_process_restart=True,
+            fatal_error_message="Slack Socket Mode did not reconnect",
+        )
+        runner._profile_adapters = {"ady": {platform: adapter}}
+
+        await runner._handle_profile_adapter_fatal_error("ady", platform, adapter)
+
+        assert runner.should_exit_with_failure is True
+        assert runner.exit_reason == "Slack Socket Mode did not reconnect"
+        runner.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_watchdog_restarts_when_socket_task_stops(self, adapter):
