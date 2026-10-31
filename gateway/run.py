@@ -9128,6 +9128,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        if getattr(adapter, "fatal_error_requires_process_restart", False):
+            self._exit_reason = (
+                adapter.fatal_error_message
+                or f"{adapter.platform.value} adapter requires process restart"
+            )
+            self._exit_with_failure = True
+            logger.error(
+                "%s requires a process restart: %s",
+                adapter.platform.value,
+                self._exit_reason,
+            )
+            await self.stop()
+            return
+
         logger.error(
             "Fatal %s adapter error (%s): %s",
             adapter.platform.value,
@@ -17074,6 +17088,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform.value,
                 profile_name,
             )
+            return
+        if getattr(adapter, "fatal_error_requires_process_restart", False):
+            self._exit_reason = (
+                adapter.fatal_error_message
+                or f"{platform.value} adapter requires process restart"
+            )
+            self._exit_with_failure = True
+            logger.error(
+                "%s requires a process restart: %s",
+                platform.value,
+                self._exit_reason,
+            )
+            await self.stop()
             return
         profile_map.pop(platform, None)
         await self._safe_adapter_disconnect(adapter, platform)
