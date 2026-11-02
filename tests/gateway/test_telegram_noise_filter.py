@@ -4,24 +4,31 @@ import pytest
 
 from agent.conversation_compression import (
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
+    COMPACTION_DONE_STATUS,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
 from gateway.config import Platform
 from gateway.run import (
+    _gateway_surface_passes_raw_text,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
 
-# Every human-facing chat surface that must receive noise-filtered,
-# secret-redacted, provider-error-sanitized output (not just Telegram).
-# The filtering functions under test (_prepare_gateway_status_message /
-# _sanitize_gateway_final_response) are platform-agnostic shared logic in
-# gateway.run — a representative platform subset is sufficient; per-platform
-# copies were near-duplicate parametrizations.
+# Every enum-backed human-facing chat surface. The filtering functions under
+# test (_prepare_gateway_status_message / _sanitize_gateway_final_response)
+# are shared in gateway.run; programmatic surfaces keep raw diagnostics.
 CHAT_PLATFORMS = [
-    "telegram",
-    "slack",
-    "feishu",
+    platform for platform in Platform if not _gateway_surface_passes_raw_text(platform)
+]
+NON_TELEGRAM_CHAT_PLATFORMS = [
+    platform for platform in CHAT_PLATFORMS if platform != Platform.TELEGRAM
+]
+
+SILENT_COMPRESSION_STATUSES = [
+    COMPACTION_DONE_STATUS,
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason="ineffective"
+    ),
 ]
 
 NOISY_STATUS_MESSAGES = [
@@ -59,10 +66,10 @@ NOISY_STATUS_MESSAGES = [
     ),
 ]
 
-# Messages that must NEVER be swallowed by the compression-noise filter:
-# deliberate carve-outs from routine-compression silence — manual /compress
-# feedback (manual_compression_feedback.py headlines) and abort/failure
-# notices that require user action.
+# Messages that must NEVER be swallowed by routine-compression silence:
+# manual /compress feedback (manual_compression_feedback.py headlines) and
+# abort/failure notices that require user action. The automatic blocked-
+# overflow status is tested separately because chat gateways suppress it.
 VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
@@ -88,18 +95,6 @@ VISIBLE_COMPRESSION_MESSAGES = [
         "⏳ Compression skipped: could not acquire this session's "
         "compression lock. Another compression may still be running, or "
         "the lock check failed — try again shortly."
-    ),
-    # Blocked-overflow warning (#62625/#62708): the context is over the
-    # compression threshold but compression is blocked (summary-LLM cooldown
-    # or the anti-thrash breaker). FAILURE-CLASS — must reach chat users so
-    # they can /new or /compress before the session dies at the hard token
-    # limit. Formatted from the SAME template the emit site uses, so a
-    # rewording that drifts into the noise regex fails here.
-    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-        tokens=85_000, threshold=72_000, reason="cooldown:30"
-    ),
-    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-        tokens=85_000, threshold=72_000, reason="ineffective"
     ),
 ]
 
@@ -163,6 +158,31 @@ def test_all_routine_compression_statuses_suppressed_from_source_constants(
     the literal into this file.
     """
     assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+
+
+@pytest.mark.parametrize("platform", NON_TELEGRAM_CHAT_PLATFORMS)
+@pytest.mark.parametrize("message", SILENT_COMPRESSION_STATUSES)
+def test_terminal_compaction_statuses_stay_silent_even_when_progress_is_enabled(
+    monkeypatch, platform, message
+):
+    """Non-Telegram channels suppress these exact internal status lines."""
+    monkeypatch.setattr(
+        "gateway.run._gateway_compression_progress_notices_enabled",
+        lambda: True,
+    )
+    assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+
+
+@pytest.mark.parametrize("reason", ["cooldown:30", "ineffective"])
+def test_telegram_keeps_blocked_overflow_warning_visible(reason):
+    """Telegram keeps its existing actionable blocked-overflow warning."""
+    message = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason=reason
+    )
+    assert (
+        _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", message)
+        == message
+    )
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)

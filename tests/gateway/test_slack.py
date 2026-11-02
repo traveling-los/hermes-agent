@@ -1669,6 +1669,7 @@ class TestIncomingDocumentHandling:
         assert "Hello from a text file" in msg_event.text
         assert "[Content of notes.txt]" in msg_event.text
         assert "summarize this" in msg_event.text
+        assert msg_event.media_text_inlined == [True]
 
     @pytest.mark.asyncio
     async def test_md_document_injects_content(self, adapter):
@@ -1731,7 +1732,7 @@ class TestIncomingDocumentHandling:
 
     @pytest.mark.asyncio
     async def test_large_txt_not_injected(self, adapter):
-        """A .txt file over 100KB should be cached but NOT injected."""
+        """A large .txt file is cached and summarized for later read_file use."""
         content = b"x" * (200 * 1024)
 
         with patch.object(
@@ -1753,7 +1754,69 @@ class TestIncomingDocumentHandling:
 
         msg_event = adapter.handle_message.call_args[0][0]
         assert len(msg_event.media_urls) == 1
+        assert msg_event.media_text_inlined == [False]
         assert "[Content of" not in (msg_event.text or "")
+        assert "read_file" in (msg_event.text or "")
+        assert content.decode() not in (msg_event.text or "")
+
+    @pytest.mark.asyncio
+    async def test_repeated_100k_csv_is_summarized_once_below_80k_floor(self, adapter):
+        """A repeated large CSV stays on disk and adds only a short prompt note."""
+        header = "date,amount,description\n"
+        row = "2026-11-02,100,abcdefgh\n"
+        csv_text = header + row * 4_200
+        content = csv_text.encode("utf-8")
+        assert 100_000 <= len(content) <= 100 * 1024
+
+        file_obj = {
+            "id": "F_LARGE_CSV",
+            "mimetype": "text/csv",
+            "name": "report.csv",
+            "url_private_download": "https://files.slack.com/report.csv",
+            "size": len(content),
+        }
+        event = self._make_event(
+            text="Please review this report.",
+            files=[dict(file_obj) for _ in range(4)],
+        )
+
+        with patch.object(
+            adapter, "_download_slack_file_bytes", new_callable=AsyncMock
+        ) as dl:
+            dl.return_value = content
+            await adapter._handle_slack_message(event)
+
+        dl.assert_awaited_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_text_inlined == [False]
+        assert msg_event.media_types == ["text/csv"]
+        assert msg_event.text.count("Large text attachment summary") == 1
+        assert "read_file" in msg_event.text
+        assert csv_text not in msg_event.text
+        assert row not in msg_event.text
+
+        from gateway.run import _build_document_context_note
+
+        context_note = _build_document_context_note(
+            "report.csv",
+            msg_event.media_urls[0],
+            msg_event.media_types[0],
+            content_inlined=msg_event.media_text_inlined[0],
+        )
+        prompt_text = f"{context_note}\n\n{msg_event.text}"
+        assert context_note.count(msg_event.media_urls[0]) == 1
+        assert csv_text not in prompt_text
+
+        # The measured Ady floor was ~67,052 tokens against an 80,000 threshold.
+        # Four legacy inline copies of this ~100k-character file exceed it;
+        # the new path+summary note leaves comfortable headroom.
+        floor_tokens = 67_052
+        threshold_tokens = 80_000
+        legacy_attachment_tokens = (4 * len(csv_text) + 3) // 4
+        new_prompt_tokens = (len(prompt_text) + 3) // 4
+        assert floor_tokens + legacy_attachment_tokens > threshold_tokens
+        assert floor_tokens + new_prompt_tokens < threshold_tokens
 
 
     @pytest.mark.asyncio
