@@ -48,11 +48,13 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -179,6 +181,23 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         )
     ),
     re.IGNORECASE,
+)
+
+_COMPACTION_COMPLETE_STATUS_RE = re.compile(
+    re.escape(COMPACTION_DONE_STATUS), re.IGNORECASE
+)
+_CONTEXT_OVERFLOW_BLOCKED_PREFIX, _CONTEXT_OVERFLOW_BLOCKED_SUFFIX = (
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.split("{reason}", 1)
+)
+_CONTEXT_OVERFLOW_BLOCKED_STATUS_RE = re.compile(
+    _status_template_to_regex(_CONTEXT_OVERFLOW_BLOCKED_PREFIX)
+    + r"[^)\r\n]+"
+    + _status_template_to_regex(_CONTEXT_OVERFLOW_BLOCKED_SUFFIX),
+    re.IGNORECASE,
+)
+_CONTEXT_OVERFLOW_RECOVERY_MESSAGE = (
+    "Conversation is full. Send /new to continue. / "
+    "La conversación está llena. Escribe /new para seguir."
 )
 
 
@@ -616,6 +635,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if getattr(platform, "value", platform) != "telegram":
+        if _COMPACTION_COMPLETE_STATUS_RE.fullmatch(text):
+            return None
+        if _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text):
+            return _CONTEXT_OVERFLOW_RECOVERY_MESSAGE
+
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
@@ -2621,11 +2646,18 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
+def _build_document_context_note(
+    display_name: str,
+    agent_path: str,
+    mtype: str,
+    *,
+    content_inlined: Optional[bool] = None,
+) -> str:
     """Context note prepended to a user turn when they attach a document.
 
-    Text documents (``text/*``) have their content inlined upstream by the
-    platform adapter, so the note just confirms that and records the path.
+    Text documents normally have their content inlined upstream by the platform
+    adapter. ``content_inlined=False`` marks a cached file surfaced by summary
+    and path instead.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
     must tell the agent to *extract* the text itself before answering — earlier
@@ -2634,6 +2666,13 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     "unreadable" to the agent even though it has the tools to read them.
     """
     if mtype.startswith("text/"):
+        if content_inlined is False:
+            return (
+                f"[The user sent a text document: '{display_name}'. "
+                f"Its full content is not included in this message. "
+                f"The file is saved at: {agent_path}. "
+                f"Use read_file when you need its contents.]"
+            )
         return (
             f"[The user sent a text document: '{display_name}'. "
             f"Its content has been included below. "
@@ -15912,7 +15951,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
                 agent_path = to_agent_visible_cache_path(path)
 
-                context_note = _build_document_context_note(display_name, agent_path, mtype)
+                media_text_inlined = getattr(event, "media_text_inlined", None)
+                content_inlined = None
+                if (
+                    isinstance(media_text_inlined, (list, tuple))
+                    and i < len(media_text_inlined)
+                ):
+                    content_inlined = media_text_inlined[i]
+                context_note = _build_document_context_note(
+                    display_name,
+                    agent_path,
+                    mtype,
+                    content_inlined=content_inlined,
+                )
                 message_text = f"{context_note}\n\n{message_text}"
 
         # Discord: surface the triggering message id per-turn on the user

@@ -78,13 +78,14 @@ def test_enabled_still_suppresses_non_compression_noise(
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "default"])
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)
-def test_compaction_completion_notice_reaches_chat(monkeypatch, platform, enabled):
-    """The #69546 'compacted' lifecycle edge is deliverable on chat surfaces.
+def test_compaction_completion_notice_is_hidden_outside_telegram(
+    monkeypatch, platform, enabled
+):
+    """Hide the compaction implementation notice from non-Telegram users.
 
     COMPACTION_DONE_STATUS already flows through the status callback on
-    compaction completion and is not matched by the noise regex — the opt-in
-    gate must not change that in either mode, so users who enable
-    progress_notices see the completion stat notice paired with the start.
+    compaction completion. The status is internal to the gateway and should
+    not look like an agent reply in Slack or other non-Telegram chat.
     """
     monkeypatch.setattr(
         gateway_run,
@@ -93,7 +94,7 @@ def test_compaction_completion_notice_reaches_chat(monkeypatch, platform, enable
     )
     assert (
         _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
-        == COMPACTION_DONE_STATUS
+        == (COMPACTION_DONE_STATUS if platform == "telegram" else None)
     )
 
 

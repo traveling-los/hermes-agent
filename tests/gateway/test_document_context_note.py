@@ -27,6 +27,18 @@ class TestTextDocumentNote:
         assert "/cache/doc_notes.txt" in note
         assert "included below" in note
 
+    def test_large_text_note_points_to_file_without_claiming_full_content(self):
+        note = _build_document_context_note(
+            "report.csv",
+            "/cache/report.csv",
+            "text/csv",
+            content_inlined=False,
+        )
+        assert "full content is not included" in note
+        assert "/cache/report.csv" in note
+        assert "read_file" in note
+        assert "included below" not in note
+
 
 class TestBinaryDocumentNote:
     @pytest.mark.parametrize(
