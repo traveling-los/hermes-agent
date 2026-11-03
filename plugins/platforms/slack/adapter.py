@@ -9,6 +9,7 @@ Uses slack-bolt (Python) with Socket Mode for:
 """
 
 import asyncio
+import csv
 import contextvars
 import inspect
 import json
@@ -77,6 +78,34 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_MAX_INLINE_TEXT_ATTACHMENT_CHARS = 20_000
+
+
+def _large_text_attachment_summary(filename: str, content: str) -> str:
+    """Build a short, data-free summary for a cached large text attachment."""
+    display_name = re.sub(r"[^\w.\- ]", "_", filename or "document.txt")
+    extension = os.path.splitext(display_name)[1].lower()
+    is_csv = extension == ".csv"
+    line_count = content.count("\n")
+    if content and not content.endswith("\n"):
+        line_count += 1
+    details = [
+        "CSV" if is_csv else "text file",
+        f"{len(content):,} characters",
+        f"{line_count:,} lines",
+    ]
+    if is_csv:
+        first_line = content.split("\n", 1)[0]
+        try:
+            column_count = len(next(csv.reader([first_line]), []))
+        except csv.Error:
+            column_count = 0
+        if column_count:
+            details.append(f"{column_count} columns")
+    return (
+        f"[Large text attachment summary: {display_name} ({', '.join(details)}). "
+        "Read the full file with read_file when you need its contents.]"
+    )
 
 
 def _slack_unfurl_kwargs(extra: Optional[Dict[str, Any]]) -> Dict[str, bool]:
@@ -6754,9 +6783,22 @@ class SlackAdapter(BasePlatformAdapter):
         # delivered ahead of the trigger message's own files.
         media_urls = list(thread_root_media_urls)
         media_types = list(thread_root_media_types)
+        media_text_inlined: List[Optional[bool]] = [None] * len(media_urls)
         attachment_notices: List[str] = []
         files = event.get("files", [])
+        seen_file_refs = set()
         for f in files:
+            file_id = str(f.get("id") or "").strip()
+            file_url = str(
+                f.get("url_private_download") or f.get("url_private") or ""
+            ).strip()
+            file_ref = ("id", file_id) if file_id else ("url", file_url)
+            if file_ref[1]:
+                if file_ref in seen_file_refs:
+                    logger.debug("[Slack] Skipping duplicate file reference %s", file_ref[1])
+                    continue
+                seen_file_refs.add(file_ref)
+
             # Slack Connect channels return stub file objects with
             # file_access="check_file_info" and no URL fields. We must
             # call files.info to retrieve the full object (including url_private_download)
@@ -6810,6 +6852,7 @@ class SlackAdapter(BasePlatformAdapter):
                     cached = await self._download_slack_file(url, ext, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
+                    media_text_inlined.append(None)
                 except Exception as e:  # pragma: no cover - defensive logging
                     detail = self._describe_slack_download_failure(e, file_obj=f)
                     if detail:
@@ -6830,6 +6873,7 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     media_urls.append(cached)
                     media_types.append(mimetype)
+                    media_text_inlined.append(None)
                 except Exception as e:  # pragma: no cover - defensive logging
                     detail = self._describe_slack_download_failure(e, file_obj=f)
                     if detail:
@@ -6860,6 +6904,7 @@ class SlackAdapter(BasePlatformAdapter):
                     media_types.append(
                         _SLACK_EXT_TO_AUDIO_MIME.get(ext, "audio/mp4")
                     )
+                    media_text_inlined.append(None)
                     logger.debug(
                         "[Slack] Cached voice clip (mislabeled %s) as audio: %s",
                         mimetype,
@@ -6896,6 +6941,7 @@ class SlackAdapter(BasePlatformAdapter):
                     media_types.append(
                         SUPPORTED_VIDEO_TYPES.get(ext, mimetype or "video/mp4")
                     )
+                    media_text_inlined.append(None)
                     logger.debug("[Slack] Cached user video: %s", cached_path)
                 except Exception as e:  # pragma: no cover - defensive logging
                     detail = self._describe_slack_download_failure(e, file_obj=f)
@@ -6954,28 +7000,32 @@ class SlackAdapter(BasePlatformAdapter):
                         doc_mime = mimetype or "application/octet-stream"
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
+                    media_text_inlined.append(None)
                     logger.debug("[Slack] Cached user document: %s (%s)", cached_path, doc_mime)
 
-                    # Inject small text-ish files directly into the prompt so
-                    # snippets like JSON/YAML/configs are actually visible to the
-                    # agent. Gate on a text-like extension/MIME — NOT a blind
-                    # UTF-8 decode, since binary formats (PDF/zip/docx) can have
-                    # decodable ASCII headers. Binary files are surfaced as a
-                    # cached path only (run.py emits a path-pointing note).
-                    MAX_TEXT_INJECT_BYTES = 100 * 1024
+                    # Inline only short text files. Large files stay cached;
+                    # the summary is small and run.py adds the agent-visible
+                    # path note with content_inlined=False for read_file.
                     _is_text = ext in _TEXT_INJECT_EXTENSIONS or (mimetype or "").startswith("text/")
-                    if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                    if _is_text:
                         try:
                             text_content = raw_bytes.decode("utf-8")
                             display_name = original_filename or f"document{ext or '.txt'}"
                             display_name = re.sub(r"[^\w.\- ]", "_", display_name)
-                            injection = f"[Content of {display_name}]:\n{text_content}"
+                            if len(text_content) <= _MAX_INLINE_TEXT_ATTACHMENT_CHARS:
+                                injection = f"[Content of {display_name}]:\n{text_content}"
+                                media_text_inlined[-1] = True
+                            else:
+                                injection = _large_text_attachment_summary(
+                                    display_name, text_content
+                                )
+                                media_text_inlined[-1] = False
                             if text:
                                 text = f"{injection}\n\n{text}"
                             else:
                                 text = injection
                         except UnicodeDecodeError:
-                            pass  # Binary content, skip injection
+                            media_text_inlined[-1] = False
 
                 except Exception as e:  # pragma: no cover - defensive logging
                     detail = self._describe_slack_download_failure(e, file_obj=f)
@@ -7099,6 +7149,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_id=ts,
             media_urls=media_urls,
             media_types=media_types,
+            media_text_inlined=media_text_inlined,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
             channel_context=channel_context,

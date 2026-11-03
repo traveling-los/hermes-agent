@@ -180,14 +180,11 @@ COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
     "🗜️ Context reduced to {new_ctx:,} tokens (was {old_ctx:,}), retrying..."
 )
 
-# FAILURE-CLASS notice — a deliberate carve-out from routine-compression
-# silence (#16775 class): the context is over the compression threshold but
-# compression is blocked (summary-LLM cooldown / anti-thrash breaker), so the
-# session will keep growing until the hard provider token limit kills it.
-# This MUST stay visible on chat gateways. Do NOT add it to
-# ROUTINE_COMPRESSION_STATUS_SAMPLES or the gateway noise regex
-# (_TELEGRAM_NOISY_STATUS_RE); it is pinned un-swallowed in
-# tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
+# FAILURE-CLASS notice: the context is over the compression threshold but
+# compression is blocked (summary-LLM cooldown / anti-thrash breaker). Telegram
+# and local/programmatic surfaces retain this diagnostic; other gateway chat
+# surfaces replace it with a short /new hint. Keep it out of the routine-
+# progress sample list.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold "
     "(~{tokens:,} tokens >= {threshold:,}) "

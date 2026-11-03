@@ -13,13 +13,18 @@ The default-OFF path must stay byte-identical to silent-by-design main:
 tests/gateway/test_telegram_noise_filter.py pins that suite unchanged.
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 import gateway.run as gateway_run
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
+from gateway.config import Platform
 from gateway.run import _prepare_gateway_status_message
 
 # Chat surfaces the opt-in must deliver to (subset of the noise-filter
@@ -81,17 +86,82 @@ def test_enabled_still_suppresses_non_compression_noise(
 def test_compaction_completion_notice_respects_progress_notices_gate(
     monkeypatch, platform, enabled
 ):
-    """The completion edge follows the same opt-in gate as the start edge."""
+    """Only Telegram retains the opt-in gate for the completion edge."""
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_config",
         lambda: {"compression": {"progress_notices": enabled}},
     )
     result = _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
-    if enabled:
+    if platform == "telegram" and enabled:
         assert result == COMPACTION_DONE_STATUS
     else:
         assert result is None
+
+
+def test_slack_status_callback_does_not_dispatch_compaction_complete(monkeypatch):
+    """Slack never sends the internal compaction-complete status line."""
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"compression": {"progress_notices": True}},
+    )
+    ctx = SimpleNamespace(
+        _status_adapter=object(),
+        _run_still_current=lambda: True,
+        source=SimpleNamespace(platform=Platform.SLACK),
+        _status_chat_id="C123",
+        _status_thread_metadata=None,
+        _loop_for_step=object(),
+        _cleanup_progress=False,
+    )
+    turn_runner = object.__new__(gateway_run.TurnRunner)
+    turn_runner._ctx = ctx
+
+    with (
+        patch("gateway.run._send_or_update_status_coro") as send_status,
+        patch("gateway.run.safe_schedule_threadsafe") as schedule,
+    ):
+        turn_runner._status_callback_sync("lifecycle", COMPACTION_DONE_STATUS)
+
+    send_status.assert_not_called()
+    schedule.assert_not_called()
+
+
+def test_slack_status_callback_publishes_short_overflow_recovery_notice(monkeypatch):
+    """Slack replaces a blocked-overflow diagnostic with a short /new hint."""
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {"compression": {"progress_notices": True}},
+    )
+    ctx = SimpleNamespace(
+        _status_adapter=object(),
+        _run_still_current=lambda: True,
+        source=SimpleNamespace(platform=Platform.SLACK),
+        _status_chat_id="C123",
+        _status_thread_metadata=None,
+        _loop_for_step=object(),
+        _cleanup_progress=False,
+    )
+    turn_runner = object.__new__(gateway_run.TurnRunner)
+    turn_runner._ctx = ctx
+    message = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=97_429, threshold=80_000, reason="ineffective"
+    )
+
+    with (
+        patch("gateway.run._send_or_update_status_coro") as send_status,
+        patch("gateway.run.safe_schedule_threadsafe") as schedule,
+    ):
+        turn_runner._status_callback_sync("lifecycle", message)
+
+    send_status.assert_called_once()
+    assert send_status.call_args.args[3] == (
+        "Conversation is full. Send /new to continue. / "
+        "La conversación está llena. Escribe /new para seguir."
+    )
+    schedule.assert_called_once()
 
 
 def test_enabled_gate_does_not_leak_to_raw_platforms(progress_notices_enabled):

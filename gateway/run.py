@@ -51,6 +51,7 @@ from agent.async_utils import consume_detached_task_result, safe_schedule_thread
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
@@ -494,17 +495,40 @@ def _record_hygiene_cooldown(
         logger.debug("session hygiene cooldown persist failed: %s", exc)
 
 
-def _status_template_to_regex(template: str) -> str:
+def _status_template_to_regex(
+    template: str, *, placeholder_patterns: Optional[Dict[str, str]] = None
+) -> str:
     """Compile a compression status template constant into a regex source.
 
     Literal text is escaped verbatim (so wording drift in
     agent/conversation_compression.py cannot silently diverge from this
-    matcher — the constants ARE the wording) and each ``{field}`` format
-    placeholder is replaced with a numeric-ish pattern covering every value
-    the emit sites format in (ints, ``{:,}`` thousands separators).
+    matcher — the constants ARE the wording). By default each ``{field}``
+    format placeholder is numeric-ish; callers can override patterns for
+    nonnumeric fields such as the blocked-warning reason.
     """
-    parts = re.split(r"\{[^{}]*\}", template)
-    return r"[\d,]+".join(re.escape(part) for part in parts)
+    parts = re.split(r"(\{[^{}]*\})", template)
+    patterns = placeholder_patterns or {}
+    return "".join(
+        patterns.get(part, r"[\d,]+")
+        if part.startswith("{") and part.endswith("}")
+        else re.escape(part)
+        for part in parts
+    )
+
+
+_COMPACTION_COMPLETE_STATUS_RE = re.compile(
+    "^" + _status_template_to_regex(COMPACTION_DONE_STATUS) + "$",
+    re.IGNORECASE,
+)
+_CONTEXT_OVERFLOW_BLOCKED_STATUS_RE = re.compile(
+    "^"
+    + _status_template_to_regex(
+        CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
+        placeholder_patterns={"{reason}": r"[^)\r\n]+"},
+    )
+    + "$",
+    re.IGNORECASE,
+)
 
 
 # ROUTINE compression progress statuses, derived from the SAME template
@@ -1029,13 +1053,27 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
-    surfaces should not receive transient auxiliary/compression chatter.
+    surfaces should not receive transient auxiliary/compression chatter or
+    the internal compaction-complete line. Blocked overflow gets a short
+    recovery instruction instead of the internal diagnostic.
     """
     text = str(message or "").strip()
     if not text:
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    # Telegram keeps its existing progress-notice behavior and detailed
+    # blocked-overflow warning. Other chat channels hide compaction completion
+    # and replace the blocked diagnostic with one short recovery instruction.
+    if getattr(platform, "value", platform) != "telegram":
+        if _COMPACTION_COMPLETE_STATUS_RE.fullmatch(text):
+            return None
+        if _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text):
+            return (
+                "Conversation is full. Send /new to continue. / "
+                "La conversación está llena. Escribe /new para seguir."
+            )
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
