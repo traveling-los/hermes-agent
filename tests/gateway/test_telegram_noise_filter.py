@@ -186,7 +186,10 @@ def test_blocked_overflow_gets_short_recovery_hint_on_non_telegram_chat(
     )
     assert (
         _prepare_gateway_status_message(platform, "lifecycle", message)
-        == "La conversación está llena. Escribe /new para seguir."
+        == (
+            "Conversation is full. Send /new to continue. / "
+            "La conversación está llena. Escribe /new para seguir."
+        )
     )
 
 

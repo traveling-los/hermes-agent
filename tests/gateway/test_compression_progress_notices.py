@@ -157,7 +157,10 @@ def test_slack_status_callback_publishes_short_overflow_recovery_notice(monkeypa
         turn_runner._status_callback_sync("lifecycle", message)
 
     send_status.assert_called_once()
-    assert send_status.call_args.args[3] == "La conversación está llena. Escribe /new para seguir."
+    assert send_status.call_args.args[3] == (
+        "Conversation is full. Send /new to continue. / "
+        "La conversación está llena. Escribe /new para seguir."
+    )
     schedule.assert_called_once()
 
 

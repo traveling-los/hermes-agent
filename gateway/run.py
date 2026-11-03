@@ -1070,7 +1070,10 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         if _COMPACTION_COMPLETE_STATUS_RE.fullmatch(text):
             return None
         if _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text):
-            return "La conversación está llena. Escribe /new para seguir."
+            return (
+                "Conversation is full. Send /new to continue. / "
+                "La conversación está llena. Escribe /new para seguir."
+            )
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
