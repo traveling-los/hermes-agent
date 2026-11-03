@@ -89,18 +89,6 @@ VISIBLE_COMPRESSION_MESSAGES = [
         "compression lock. Another compression may still be running, or "
         "the lock check failed — try again shortly."
     ),
-    # Blocked-overflow warning (#62625/#62708): the context is over the
-    # compression threshold but compression is blocked (summary-LLM cooldown
-    # or the anti-thrash breaker). FAILURE-CLASS — must reach chat users so
-    # they can /new or /compress before the session dies at the hard token
-    # limit. Formatted from the SAME template the emit site uses, so a
-    # rewording that drifts into the noise regex fails here.
-    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-        tokens=85_000, threshold=72_000, reason="cooldown:30"
-    ),
-    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-        tokens=85_000, threshold=72_000, reason="ineffective"
-    ),
 ]
 
 
@@ -175,6 +163,27 @@ def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, mes
     regex must not start eating them.
     """
     assert _prepare_gateway_status_message(platform, "warn", message) == message
+
+
+@pytest.mark.parametrize("platform", ["slack", "feishu"])
+@pytest.mark.parametrize("reason", ["cooldown:30", "ineffective"])
+def test_blocked_overflow_gets_short_bilingual_recovery_hint(platform, reason):
+    message = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason=reason
+    )
+    assert (
+        _prepare_gateway_status_message(platform, "warn", message)
+        == "Conversation is full. Send /new to continue. / "
+        "La conversación está llena. Escribe /new para seguir."
+    )
+
+
+@pytest.mark.parametrize("reason", ["cooldown:30", "ineffective"])
+def test_telegram_keeps_blocked_overflow_warning(reason):
+    message = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason=reason
+    )
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) == message
 
 
 @pytest.mark.parametrize("platform", ["slack", "matrix"])
