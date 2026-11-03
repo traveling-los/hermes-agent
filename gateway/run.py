@@ -516,15 +516,17 @@ def _status_template_to_regex(
     )
 
 
-_INTERNAL_TERMINAL_COMPRESSION_STATUS_RE = re.compile(
-    "^(?:"
-    + _status_template_to_regex(COMPACTION_DONE_STATUS)
-    + "|"
+_COMPACTION_COMPLETE_STATUS_RE = re.compile(
+    "^" + _status_template_to_regex(COMPACTION_DONE_STATUS) + "$",
+    re.IGNORECASE,
+)
+_CONTEXT_OVERFLOW_BLOCKED_STATUS_RE = re.compile(
+    "^"
     + _status_template_to_regex(
         CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
         placeholder_patterns={"{reason}": r"[^)\r\n]+"},
     )
-    + ")$",
+    + "$",
     re.IGNORECASE,
 )
 
@@ -1052,7 +1054,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
     surfaces should not receive transient auxiliary/compression chatter or
-    the internal compaction-complete and blocked-overflow status lines.
+    the internal compaction-complete line. Blocked overflow gets a short
+    recovery instruction instead of the internal diagnostic.
     """
     text = str(message or "").strip()
     if not text:
@@ -1060,14 +1063,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    # Telegram keeps its existing progress-notice behavior. Other chat
-    # channels suppress these exact internal producer messages even when
-    # routine progress notices are enabled.
-    if (
-        getattr(platform, "value", platform) != "telegram"
-        and _INTERNAL_TERMINAL_COMPRESSION_STATUS_RE.fullmatch(text)
-    ):
-        return None
+    # Telegram keeps its existing progress-notice behavior and detailed
+    # blocked-overflow warning. Other chat channels hide compaction completion
+    # and replace the blocked diagnostic with one short recovery instruction.
+    if getattr(platform, "value", platform) != "telegram":
+        if _COMPACTION_COMPLETE_STATUS_RE.fullmatch(text):
+            return None
+        if _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text):
+            return "La conversación está llena. Escribe /new para seguir."
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):

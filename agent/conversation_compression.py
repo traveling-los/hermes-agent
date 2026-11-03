@@ -182,9 +182,9 @@ COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE = (
 
 # FAILURE-CLASS notice: the context is over the compression threshold but
 # compression is blocked (summary-LLM cooldown / anti-thrash breaker). Telegram
-# and local/programmatic surfaces retain the notice; other gateway chat
-# surfaces suppress it with the compaction-complete status. Keep it out of the
-# routine-progress sample list.
+# and local/programmatic surfaces retain this diagnostic; other gateway chat
+# surfaces replace it with a short /new hint. Keep it out of the routine-
+# progress sample list.
 CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "⚠ Context is over the compression threshold "
     "(~{tokens:,} tokens >= {threshold:,}) "

@@ -26,9 +26,6 @@ NON_TELEGRAM_CHAT_PLATFORMS = [
 
 SILENT_COMPRESSION_STATUSES = [
     COMPACTION_DONE_STATUS,
-    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
-        tokens=85_000, threshold=72_000, reason="ineffective"
-    ),
 ]
 
 NOISY_STATUS_MESSAGES = [
@@ -69,7 +66,8 @@ NOISY_STATUS_MESSAGES = [
 # Messages that must NEVER be swallowed by routine-compression silence:
 # manual /compress feedback (manual_compression_feedback.py headlines) and
 # abort/failure notices that require user action. The automatic blocked-
-# overflow status is tested separately because chat gateways suppress it.
+# overflow status is tested separately because chat gateways replace it with
+# a short /new hint.
 VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
@@ -162,15 +160,34 @@ def test_all_routine_compression_statuses_suppressed_from_source_constants(
 
 @pytest.mark.parametrize("platform", NON_TELEGRAM_CHAT_PLATFORMS)
 @pytest.mark.parametrize("message", SILENT_COMPRESSION_STATUSES)
-def test_terminal_compaction_statuses_stay_silent_even_when_progress_is_enabled(
+def test_compaction_complete_stays_silent_even_when_progress_is_enabled(
     monkeypatch, platform, message
 ):
-    """Non-Telegram channels suppress these exact internal status lines."""
+    """Non-Telegram channels suppress the internal compaction-complete line."""
     monkeypatch.setattr(
         "gateway.run._gateway_compression_progress_notices_enabled",
         lambda: True,
     )
     assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+
+
+@pytest.mark.parametrize("platform", NON_TELEGRAM_CHAT_PLATFORMS)
+@pytest.mark.parametrize("reason", ["cooldown:30", "ineffective"])
+def test_blocked_overflow_gets_short_recovery_hint_on_non_telegram_chat(
+    monkeypatch, platform, reason
+):
+    """Non-Telegram channels show users how to continue after blocked overflow."""
+    monkeypatch.setattr(
+        "gateway.run._gateway_compression_progress_notices_enabled",
+        lambda: True,
+    )
+    message = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason=reason
+    )
+    assert (
+        _prepare_gateway_status_message(platform, "lifecycle", message)
+        == "La conversación está llena. Escribe /new para seguir."
+    )
 
 
 @pytest.mark.parametrize("reason", ["cooldown:30", "ineffective"])
