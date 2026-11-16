@@ -15,7 +15,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.conversation_loop import _billing_failure_result, _billing_terminal_label
+from agent.conversation_loop import (
+    _BILLING_CLIENT_MESSAGE,
+    _billing_failure_result,
+    _billing_terminal_label,
+)
 from agent.error_classifier import FailoverReason, classify_api_error
 
 
@@ -57,8 +61,7 @@ def _classified_confirmed():
 
 class TestTerminalResponse:
     def test_unverified_terminal_response_does_not_assert_billing(self):
-        """The exact ambiguous 400 must not produce an unhedged
-        'Billing or credits exhausted' terminal response."""
+        """Billing detail never reaches the client-facing final_response."""
         result = _billing_failure_result(
             classified=_classified_unverified(),
             summary="HTTP 400: out of extra usage",
@@ -69,11 +72,10 @@ class TestTerminalResponse:
             model="claude-opus-5",
         )
         final = result["final_response"]
-        assert not final.startswith("Billing or credits exhausted")
-        assert "unverified" in final
-        assert "content-filter" in final or "content filter" in final
-        # The guidance must ride along and hedge too.
-        assert "still shows quota remaining" in final
+        assert final == _BILLING_CLIENT_MESSAGE
+        assert "Billing" not in final
+        assert "credits" not in final
+        assert result["error"] == "HTTP 400: out of extra usage"
 
     def test_unverified_terminal_response_structured_fields(self):
         """The structured result carries the ambiguity, not just the prose."""
@@ -94,8 +96,7 @@ class TestTerminalResponse:
             assert block.get("unverified") is True
 
     def test_confirmed_terminal_response_stays_assertive(self):
-        """A confirmed billing verdict keeps the original terminal label and
-        carries no ambiguity flag."""
+        """A confirmed billing verdict still hides operator detail from clients."""
         result = _billing_failure_result(
             classified=_classified_confirmed(),
             summary="HTTP 400: credit balance too low",
@@ -105,8 +106,9 @@ class TestTerminalResponse:
             base_url="https://api.anthropic.com",
             model="claude-opus-5",
         )
-        assert result["final_response"].startswith("Billing or credits exhausted")
+        assert result["final_response"] == _BILLING_CLIENT_MESSAGE
         assert result["billing_unverified"] is False
+        assert result["error"] == "HTTP 400: credit balance too low"
         block = result["billing_block"]
         if block is not None:
             assert "unverified" not in block
