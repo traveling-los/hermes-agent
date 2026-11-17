@@ -827,8 +827,8 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
 
 # Lumily fleet (AGE-209): billing detail stays in logs/operator surfaces only.
 _BILLING_CLIENT_MESSAGE = (
-    "Sorry, I couldn't complete your request right now. "
-    "Please try again in a few minutes."
+    "Perdón, no pude terminar esto ahora. "
+    "Inténtalo de nuevo en unos minutos."
 )
 
 
