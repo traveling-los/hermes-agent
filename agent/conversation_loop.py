@@ -825,6 +825,20 @@ def _billing_terminal_label(summary: str, unverified: bool) -> str:
     return f"Billing or credits exhausted: {summary}"
 
 
+# Lumily fleet (AGE-209): billing detail stays in logs/operator surfaces only.
+_BILLING_CLIENT_MESSAGE = (
+    "Perdón, no pude terminar esto ahora. "
+    "Inténtalo de nuevo en unos minutos."
+)
+
+
+def _billing_operator_detail(summary: str, unverified: bool, guidance: str = "") -> str:
+    detail = _billing_terminal_label(summary, unverified)
+    if guidance:
+        detail += f"\n\n{guidance}"
+    return detail
+
+
 def _billing_failure_result(
     *,
     classified,
@@ -851,11 +865,10 @@ def _billing_failure_result(
             model=model,
             unverified=unverified,
         )
-    final = _billing_terminal_label(summary, unverified)
-    if guidance:
-        final += f"\n\n{guidance}"
+    operator_detail = _billing_operator_detail(summary, unverified, guidance or "")
+    logger.warning("Billing failure (client-safe surface): %s", operator_detail)
     return {
-        "final_response": final,
+        "final_response": _BILLING_CLIENT_MESSAGE,
         "messages": messages,
         "api_calls": api_call_count,
         "completed": False,
@@ -6697,11 +6710,14 @@ def run_conversation(
                     _billing_unverified = False
                     if classified.reason == FailoverReason.billing:
                         _billing_unverified = classified.billing_unverified
-                        _final_response = _billing_terminal_label(
-                            _final_summary, _billing_unverified
+                        _operator_detail = _billing_operator_detail(
+                            _final_summary, _billing_unverified, _billing_guidance or ""
                         )
-                        if _billing_guidance:
-                            _final_response += f"\n\n{_billing_guidance}"
+                        logger.warning(
+                            "Billing failure after max retries (client-safe surface): %s",
+                            _operator_detail,
+                        )
+                        _final_response = _BILLING_CLIENT_MESSAGE
                         # Structured recovery descriptor so every surface renders
                         # the same link + label from one signal (see helper).
                         _billing_block = _billing_block_dict(
